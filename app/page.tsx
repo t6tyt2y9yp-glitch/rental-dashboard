@@ -28,6 +28,8 @@ type DashboardUnit = {
   paymentStatus: PaymentStatus | null;
   paymentMethod: PaymentMethod | "";
   paymentId: string | null;
+  previousReading: string;
+  currentReading: string;
   extracting: boolean;
   extraction: ReceiptExtraction | null;
   message: string | null;
@@ -145,6 +147,8 @@ function mapUnits(unitRows: UnitRow[], paymentRows: PaymentRow[]): DashboardUnit
           payment?.id === undefined || payment?.id === null
             ? null
             : String(payment.id),
+        previousReading: "",
+        currentReading: "",
         extracting: false,
         extraction: null,
         message: null,
@@ -234,6 +238,19 @@ export default function Home() {
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
   const [savingExpense, setSavingExpense] = useState(false);
+  const [totalElectricityBill, setTotalElectricityBill] = useState("");
+  const [totalMainKwh, setTotalMainKwh] = useState("");
+
+  const billAmount = Number(totalElectricityBill);
+  const mainKwh = Number(totalMainKwh);
+  const electricityRate =
+    totalElectricityBill !== "" &&
+    totalMainKwh !== "" &&
+    Number.isFinite(billAmount) &&
+    Number.isFinite(mainKwh) &&
+    mainKwh > 0
+      ? (billAmount / mainKwh).toFixed(2)
+      : null;
 
   useEffect(() => {
     let cancelled = false;
@@ -477,9 +494,21 @@ export default function Home() {
         throw new Error(errorMessage);
       }
 
+      const extraction = payload as ReceiptExtraction;
+      if (extraction.kwh_reading === null) {
+        patchUnit(item.id, {
+          extracting: false,
+          extraction,
+          message: "The receipt did not include a kWh reading.",
+        });
+        return;
+      }
+
       patchUnit(item.id, {
         extracting: false,
-        extraction: payload as ReceiptExtraction,
+        extraction,
+        currentReading: String(extraction.kwh_reading),
+        message: null,
       });
     } catch (error) {
       patchUnit(item.id, {
@@ -544,6 +573,53 @@ export default function Home() {
             );
           })}
         </div>
+
+        <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
+          <div>
+            <h2 className="text-xl font-semibold tracking-tight">
+              Electricity Rate Calculator
+            </h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Divide the main bill by total kWh to get the active rate.
+            </p>
+          </div>
+          <div className="mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end">
+            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+              Total bill
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                inputMode="decimal"
+                value={totalElectricityBill}
+                onChange={(event) => setTotalElectricityBill(event.target.value)}
+                placeholder="0.00"
+                className="rounded-lg border border-slate-300 px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+              />
+            </label>
+            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+              Total kWh
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                inputMode="decimal"
+                value={totalMainKwh}
+                onChange={(event) => setTotalMainKwh(event.target.value)}
+                placeholder="0.00"
+                className="rounded-lg border border-slate-300 px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+              />
+            </label>
+            <div className="rounded-xl bg-slate-50 px-4 py-3">
+              <p className="text-xs font-medium tracking-wide text-slate-500">
+                Active Rate
+              </p>
+              <p className="mt-1 text-lg font-semibold text-slate-900">
+                {electricityRate === null ? "—" : `₱${electricityRate} / kWh`}
+              </p>
+            </div>
+          </div>
+        </section>
 
         <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
@@ -706,59 +782,68 @@ export default function Home() {
                   </select>
                 </label>
 
-                {item.status === "Occupied" ? (
-                  <div className="flex flex-col gap-3">
-                    <label className="inline-flex cursor-pointer items-center justify-center rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700">
-                      {item.extracting ? "Reading receipt…" : "Upload receipt"}
-                      <input
-                        type="file"
-                        accept="image/*"
-                        disabled={item.extracting}
-                        className="sr-only"
-                        onChange={(event) => {
-                          const file = event.target.files?.[0];
-                          event.target.value = "";
-                          if (file) {
-                            void extractReceipt(item, file);
-                          }
-                        }}
-                      />
-                    </label>
-                    {item.extracting ? (
-                      <p className="text-sm text-slate-500">
-                        Extracting rent, electricity, and kWh…
-                      </p>
-                    ) : null}
-                    {item.extraction ? (
-                      <dl className="grid grid-cols-2 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
-                        <div>
-                          <dt className="text-slate-500">Base rent</dt>
-                          <dd className="font-medium">
-                            {formatMaybePeso(item.extraction.base_rent)}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Electricity</dt>
-                          <dd className="font-medium">
-                            {formatMaybePeso(item.extraction.electricity_fee)}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">kWh</dt>
-                          <dd className="font-medium">
-                            {item.extraction.kwh_reading ?? "—"}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Total due</dt>
-                          <dd className="font-medium">
-                            {formatMaybePeso(item.extraction.total_due)}
-                          </dd>
-                        </div>
-                      </dl>
-                    ) : null}
-                  </div>
-                ) : null}
+                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                  Previous Reading
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    inputMode="decimal"
+                    value={item.previousReading}
+                    onChange={(event) =>
+                      patchUnit(item.id, {
+                        previousReading: event.target.value,
+                        message: null,
+                      })
+                    }
+                    placeholder="0"
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                  />
+                </label>
+
+                <div className="flex items-end gap-2">
+                  <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-sm font-medium text-slate-700">
+                    Current Reading
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      inputMode="decimal"
+                      value={item.currentReading}
+                      onChange={(event) =>
+                        patchUnit(item.id, {
+                          currentReading: event.target.value,
+                          message: null,
+                        })
+                      }
+                      placeholder="0"
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                    />
+                  </label>
+                  <label className="inline-flex shrink-0 cursor-pointer items-center justify-center rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700">
+                    {item.extracting ? "Scanning…" : "Scan Receipt"}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      disabled={item.extracting}
+                      className="sr-only"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = "";
+                        if (file) {
+                          void extractReceipt(item, file);
+                        }
+                      }}
+                    />
+                  </label>
+                </div>
+
+                <MeterSummary
+                  previousReading={item.previousReading}
+                  currentReading={item.currentReading}
+                  electricityRate={electricityRate}
+                  baseRent={item.baseRent}
+                />
 
                 {item.message ? (
                   <p className="text-sm text-rose-700">{item.message}</p>
@@ -774,4 +859,51 @@ export default function Home() {
 
 function formatMaybePeso(value: number | null) {
   return value === null ? "—" : peso(value);
+}
+
+function MeterSummary({
+  previousReading,
+  currentReading,
+  electricityRate,
+  baseRent,
+}: {
+  previousReading: string;
+  currentReading: string;
+  electricityRate: string | null;
+  baseRent: number;
+}) {
+  const previous = Number(previousReading);
+  const current = Number(currentReading);
+  const rate = electricityRate === null ? null : Number(electricityRate);
+  const hasReadings =
+    previousReading !== "" &&
+    currentReading !== "" &&
+    Number.isFinite(previous) &&
+    Number.isFinite(current);
+  const consumed = hasReadings ? Math.abs(previous - current) : null;
+  const electricityCharge =
+    consumed !== null && rate !== null && Number.isFinite(rate)
+      ? consumed * rate
+      : null;
+  const totalAmountDue =
+    electricityCharge === null ? null : baseRent + electricityCharge;
+
+  return (
+    <dl className="grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <dt className="text-slate-500">Consumed kWh</dt>
+        <dd className="font-medium">
+          {consumed === null ? "—" : consumed.toLocaleString("en-PH")}
+        </dd>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <dt className="text-slate-500">Electricity Charge</dt>
+        <dd className="font-medium">{formatMaybePeso(electricityCharge)}</dd>
+      </div>
+      <div className="flex items-center justify-between gap-3 border-t border-slate-200 pt-2">
+        <dt className="font-medium text-slate-700">Total Amount Due</dt>
+        <dd className="font-semibold">{formatMaybePeso(totalAmountDue)}</dd>
+      </div>
+    </dl>
+  );
 }
