@@ -5,7 +5,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const RENT_TIERS = [2500, 3000, 5000] as const;
 const UNIT_STATUSES = ["Occupied", "Vacant", "Maintenance"] as const;
-const PAYMENT_STATUSES = ["Pending", "Paid", "Partial", "Late"] as const;
+const PAYMENT_STATUSES = ["Paid", "Partial", "Unpaid"] as const;
 const PAYMENT_METHODS = ["Cash", "GCash"] as const;
 
 type RentTier = (typeof RENT_TIERS)[number];
@@ -25,7 +25,7 @@ type DashboardUnit = {
   label: string;
   baseRent: RentTier;
   status: UnitStatus;
-  paymentStatus: PaymentStatus | null;
+  paymentStatus: PaymentStatus;
   paymentMethod: PaymentMethod | "";
   paymentId: string | null;
   previousReading: string;
@@ -72,8 +72,11 @@ function asUnitStatus(value: unknown): UnitStatus {
   return UNIT_STATUSES.find((status) => status === value) ?? "Occupied";
 }
 
-function asPaymentStatus(value: unknown): PaymentStatus | null {
-  return PAYMENT_STATUSES.find((status) => status === value) ?? null;
+function asPaymentStatus(value: unknown): PaymentStatus {
+  if (value === "Paid" || value === "Partial" || value === "Unpaid") {
+    return value;
+  }
+  return "Unpaid";
 }
 
 function asPaymentMethod(value: unknown): PaymentMethod | "" {
@@ -157,20 +160,24 @@ function mapUnits(unitRows: UnitRow[], paymentRows: PaymentRow[]): DashboardUnit
   });
 }
 
-function statusTone(status: PaymentStatus | null) {
+function statusTone(status: PaymentStatus) {
   if (status === "Paid") {
     return "bg-emerald-50 text-emerald-700 ring-emerald-200";
   }
   if (status === "Partial") {
-    return "bg-sky-50 text-sky-700 ring-sky-200";
+    return "bg-yellow-50 text-yellow-800 ring-yellow-200";
   }
-  if (status === "Late") {
-    return "bg-rose-50 text-rose-700 ring-rose-200";
+  return "bg-red-50 text-red-700 ring-red-200";
+}
+
+function statusDot(status: PaymentStatus) {
+  if (status === "Paid") {
+    return "bg-green-500";
   }
-  if (status === "Pending") {
-    return "bg-amber-50 text-amber-800 ring-amber-200";
+  if (status === "Partial") {
+    return "bg-yellow-400";
   }
-  return "bg-slate-50 text-slate-600 ring-slate-200";
+  return "bg-red-500";
 }
 
 function mapExpense(row: Record<string, unknown>): Expense | null {
@@ -447,7 +454,7 @@ export default function Home() {
         electricity_fee: 0,
         kwh_reading: null,
         total_due: item.baseRent,
-        status: item.paymentStatus ?? "Pending",
+        status: item.paymentStatus,
         payment_method: paymentMethod,
       })
       .select("id")
@@ -463,8 +470,44 @@ export default function Home() {
 
     patchUnit(item.id, {
       paymentId: String(data.id),
-      paymentStatus: item.paymentStatus ?? "Pending",
+      paymentStatus: item.paymentStatus,
     });
+  }
+
+  async function startNewMonth() {
+    const confirmed = window.confirm(
+      "Start a new month? Current readings will move to previous readings, current readings will be cleared, and every unit payment status will reset to Unpaid.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const paymentIds = units
+      .map((unit) => unit.paymentId)
+      .filter((id): id is string => id !== null);
+
+    setUnits((current) =>
+      current.map((unit) => ({
+        ...unit,
+        previousReading: unit.currentReading,
+        currentReading: "",
+        paymentStatus: "Unpaid",
+        message: null,
+      })),
+    );
+
+    if (!supabase || paymentIds.length === 0) {
+      return;
+    }
+
+    const { error } = await supabase
+      .from("Payments")
+      .update({ status: "Unpaid" })
+      .in("id", paymentIds);
+
+    if (error) {
+      setLoadError(error.message);
+    }
   }
 
   async function extractReceipt(item: DashboardUnit, file: File) {
@@ -522,13 +565,22 @@ export default function Home() {
   return (
     <div className="min-h-full bg-slate-100 text-slate-900">
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 py-8 sm:px-6 lg:px-8">
-        <header className="flex flex-col gap-2">
+        <header className="flex flex-col gap-4">
           <p className="text-sm font-medium tracking-wide text-slate-500">
             Rental ledger
           </p>
-          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
-            Units
-          </h1>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+              Units
+            </h1>
+            <button
+              type="button"
+              onClick={() => void startNewMonth()}
+              className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
+            >
+              Start New Month
+            </button>
+          </div>
           <p className="max-w-2xl text-sm leading-6 text-slate-600 sm:text-base">
             Filter by monthly rent, update occupancy, and read handwritten
             receipts for occupied units.
@@ -573,6 +625,158 @@ export default function Home() {
             );
           })}
         </div>
+
+        {loading ? (
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {Array.from({ length: 3 }, (_, index) => (
+              <div
+                key={index}
+                className="h-64 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200"
+              />
+            ))}
+          </div>
+        ) : visibleUnits.length === 0 ? (
+          <p className="rounded-2xl bg-white px-6 py-16 text-center text-slate-500 ring-1 ring-slate-200">
+            No units at {peso(activeTier)}.
+          </p>
+        ) : (
+          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {visibleUnits.map((item) => (
+              <article
+                key={item.id}
+                className="flex flex-col gap-4 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`h-3 w-3 shrink-0 rounded-full ${statusDot(item.paymentStatus)}`}
+                      title={item.paymentStatus}
+                      aria-label={`${item.label} payment status: ${item.paymentStatus}`}
+                    />
+                    <h2 className="text-lg font-semibold">{item.label}</h2>
+                  </div>
+                    <p className="text-sm text-slate-500">
+                      {peso(item.baseRent)} / month
+                    </p>
+                  </div>
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone(item.paymentStatus)}`}
+                  >
+                    {item.paymentStatus}
+                  </span>
+                </div>
+
+                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                  Previous kWh
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    inputMode="decimal"
+                    value={item.previousReading}
+                    onChange={(event) =>
+                      patchUnit(item.id, {
+                        previousReading: event.target.value,
+                        message: null,
+                      })
+                    }
+                    placeholder="Previous kWh"
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                  />
+                </label>
+
+                <div className="flex items-end gap-2">
+                  <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-sm font-medium text-slate-700">
+                    Current kWh
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      inputMode="decimal"
+                      value={item.currentReading}
+                      onChange={(event) =>
+                        patchUnit(item.id, {
+                          currentReading: event.target.value,
+                          message: null,
+                        })
+                      }
+                      placeholder="Current kWh"
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                    />
+                  </label>
+                  <label className="inline-flex shrink-0 cursor-pointer items-center justify-center rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700">
+                    {item.extracting ? "Scanning…" : "Scan Receipt"}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      disabled={item.extracting}
+                      className="sr-only"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = "";
+                        if (file) {
+                          void extractReceipt(item, file);
+                        }
+                      }}
+                    />
+                  </label>
+                </div>
+
+                <MeterSummary
+                  previousReading={item.previousReading}
+                  currentReading={item.currentReading}
+                  electricityRate={electricityRate}
+                  baseRent={item.baseRent}
+                />
+
+                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                  Unit status
+                  <select
+                    value={item.status}
+                    onChange={(event) =>
+                      void changeStatus(item, event.target.value as UnitStatus)
+                    }
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                  >
+                    {UNIT_STATUSES.map((status) => (
+                      <option key={status} value={status}>
+                        {status}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                  Payment method
+                  <select
+                    value={item.paymentMethod}
+                    onChange={(event) =>
+                      void changeMethod(
+                        item,
+                        event.target.value as PaymentMethod,
+                      )
+                    }
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                  >
+                    <option value="" disabled>
+                      Choose method
+                    </option>
+                    {PAYMENT_METHODS.map((method) => (
+                      <option key={method} value={method}>
+                        {method}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                {item.message ? (
+                  <p className="text-sm text-rose-700">{item.message}</p>
+                ) : null}
+              </article>
+            ))}
+          </section>
+        )}
 
         <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
           <div>
@@ -708,150 +912,6 @@ export default function Home() {
           )}
         </section>
 
-        {loading ? (
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {Array.from({ length: 3 }, (_, index) => (
-              <div
-                key={index}
-                className="h-64 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200"
-              />
-            ))}
-          </div>
-        ) : visibleUnits.length === 0 ? (
-          <p className="rounded-2xl bg-white px-6 py-16 text-center text-slate-500 ring-1 ring-slate-200">
-            No units at {peso(activeTier)}.
-          </p>
-        ) : (
-          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {visibleUnits.map((item) => (
-              <article
-                key={item.id}
-                className="flex flex-col gap-4 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h2 className="text-lg font-semibold">{item.label}</h2>
-                    <p className="text-sm text-slate-500">
-                      {peso(item.baseRent)} / month
-                    </p>
-                  </div>
-                  <span
-                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone(item.paymentStatus)}`}
-                  >
-                    {item.paymentStatus ?? "No payment"}
-                  </span>
-                </div>
-
-                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                  Unit status
-                  <select
-                    value={item.status}
-                    onChange={(event) =>
-                      void changeStatus(item, event.target.value as UnitStatus)
-                    }
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
-                  >
-                    {UNIT_STATUSES.map((status) => (
-                      <option key={status} value={status}>
-                        {status}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                  Payment method
-                  <select
-                    value={item.paymentMethod}
-                    onChange={(event) =>
-                      void changeMethod(
-                        item,
-                        event.target.value as PaymentMethod,
-                      )
-                    }
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
-                  >
-                    <option value="" disabled>
-                      Choose method
-                    </option>
-                    {PAYMENT_METHODS.map((method) => (
-                      <option key={method} value={method}>
-                        {method}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                  Previous Reading
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    inputMode="decimal"
-                    value={item.previousReading}
-                    onChange={(event) =>
-                      patchUnit(item.id, {
-                        previousReading: event.target.value,
-                        message: null,
-                      })
-                    }
-                    placeholder="0"
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
-                  />
-                </label>
-
-                <div className="flex items-end gap-2">
-                  <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-sm font-medium text-slate-700">
-                    Current Reading
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      inputMode="decimal"
-                      value={item.currentReading}
-                      onChange={(event) =>
-                        patchUnit(item.id, {
-                          currentReading: event.target.value,
-                          message: null,
-                        })
-                      }
-                      placeholder="0"
-                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
-                    />
-                  </label>
-                  <label className="inline-flex shrink-0 cursor-pointer items-center justify-center rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700">
-                    {item.extracting ? "Scanning…" : "Scan Receipt"}
-                    <input
-                      type="file"
-                      accept="image/*"
-                      disabled={item.extracting}
-                      className="sr-only"
-                      onChange={(event) => {
-                        const file = event.target.files?.[0];
-                        event.target.value = "";
-                        if (file) {
-                          void extractReceipt(item, file);
-                        }
-                      }}
-                    />
-                  </label>
-                </div>
-
-                <MeterSummary
-                  previousReading={item.previousReading}
-                  currentReading={item.currentReading}
-                  electricityRate={electricityRate}
-                  baseRent={item.baseRent}
-                />
-
-                {item.message ? (
-                  <p className="text-sm text-rose-700">{item.message}</p>
-                ) : null}
-              </article>
-            ))}
-          </section>
-        )}
       </main>
     </div>
   );
@@ -891,9 +951,15 @@ function MeterSummary({
   return (
     <dl className="grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
       <div className="flex items-center justify-between gap-3">
+        <dt className="text-slate-500">Current kWh</dt>
+        <dd className="text-base font-semibold text-slate-900">
+          {currentReading === "" ? "—" : `${Number(currentReading).toLocaleString("en-PH")} kWh`}
+        </dd>
+      </div>
+      <div className="flex items-center justify-between gap-3">
         <dt className="text-slate-500">Consumed kWh</dt>
-        <dd className="font-medium">
-          {consumed === null ? "—" : consumed.toLocaleString("en-PH")}
+        <dd className="text-base font-semibold text-slate-900">
+          {consumed === null ? "—" : `${consumed.toLocaleString("en-PH")} kWh`}
         </dd>
       </div>
       <div className="flex items-center justify-between gap-3">
