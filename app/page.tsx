@@ -63,6 +63,11 @@ function peso(amount: number) {
   return `₱${amount.toLocaleString("en-PH")}`;
 }
 
+const fieldClass =
+  "min-h-12 w-full rounded-lg border border-slate-300 bg-white px-3 py-3 text-base font-normal text-slate-900 outline-none focus:border-slate-900";
+const primaryButtonClass =
+  "inline-flex min-h-12 w-full items-center justify-center rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white hover:bg-slate-700 sm:w-auto";
+
 function asRentTier(value: unknown): RentTier | null {
   const amount = typeof value === "number" ? value : Number(value);
   return RENT_TIERS.find((tier) => tier === amount) ?? null;
@@ -564,7 +569,7 @@ export default function Home() {
 
   return (
     <div className="min-h-full bg-slate-100 text-slate-900">
-      <main className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 py-8 sm:px-6 lg:px-8">
+      <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-5 py-6 sm:gap-8 sm:px-6 sm:py-8 lg:px-8">
         <header className="flex flex-col gap-4">
           <p className="text-sm font-medium tracking-wide text-slate-500">
             Rental ledger
@@ -576,7 +581,7 @@ export default function Home() {
             <button
               type="button"
               onClick={() => void startNewMonth()}
-              className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
+              className={primaryButtonClass}
             >
               Start New Month
             </button>
@@ -593,11 +598,12 @@ export default function Home() {
           </p>
         ) : null}
 
-        <div
-          role="tablist"
-          aria-label="Rent tiers"
-          className="grid grid-cols-1 gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-slate-200 sm:grid-cols-3"
-        >
+        <div className="overflow-x-auto pb-1">
+          <div
+            role="tablist"
+            aria-label="Rent tiers"
+            className="flex w-max min-w-full gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-slate-200 md:grid md:w-full md:grid-cols-3"
+          >
           {RENT_TIERS.map((tier) => {
             const count = units.filter((item) => item.baseRent === tier).length;
             const selected = activeTier === tier;
@@ -608,7 +614,7 @@ export default function Home() {
                 role="tab"
                 aria-selected={selected}
                 onClick={() => setActiveTier(tier)}
-                className={`rounded-xl px-4 py-3 text-left transition ${
+                className={`min-h-12 min-w-[11.5rem] shrink-0 flex-1 rounded-xl px-4 py-3 text-left transition md:min-w-0 ${
                   selected
                     ? "bg-slate-900 text-white"
                     : "text-slate-700 hover:bg-slate-100"
@@ -624,10 +630,11 @@ export default function Home() {
               </button>
             );
           })}
+          </div>
         </div>
 
         {loading ? (
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 3 }, (_, index) => (
               <div
                 key={index}
@@ -640,7 +647,7 @@ export default function Home() {
             No units at {peso(activeTier)}.
           </p>
         ) : (
-          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <section className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
             {visibleUnits.map((item) => (
               <article
                 key={item.id}
@@ -682,11 +689,11 @@ export default function Home() {
                       })
                     }
                     placeholder="Previous kWh"
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                    className={fieldClass}
                   />
                 </label>
 
-                <div className="flex items-end gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
                   <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-sm font-medium text-slate-700">
                     Current kWh
                     <input
@@ -702,10 +709,10 @@ export default function Home() {
                         })
                       }
                       placeholder="Current kWh"
-                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                      className={fieldClass}
                     />
                   </label>
-                  <label className="inline-flex shrink-0 cursor-pointer items-center justify-center rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700">
+                  <label className={`${primaryButtonClass} cursor-pointer sm:shrink-0`}>
                     {item.extracting ? "Scanning…" : "Scan Receipt"}
                     <input
                       type="file"
@@ -737,7 +744,7 @@ export default function Home() {
                     onChange={(event) =>
                       void changeStatus(item, event.target.value as UnitStatus)
                     }
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                    className={fieldClass}
                   >
                     {UNIT_STATUSES.map((status) => (
                       <option key={status} value={status}>
@@ -757,7 +764,7 @@ export default function Home() {
                         event.target.value as PaymentMethod,
                       )
                     }
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                    className={fieldClass}
                   >
                     <option value="" disabled>
                       Choose method
@@ -787,7 +794,7 @@ export default function Home() {
               Divide the main bill by total kWh to get the active rate.
             </p>
           </div>
-          <div className="mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end">
+          <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-end">
             <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
               Total bill
               <input
@@ -798,7 +805,7 @@ export default function Home() {
                 value={totalElectricityBill}
                 onChange={(event) => setTotalElectricityBill(event.target.value)}
                 placeholder="0.00"
-                className="rounded-lg border border-slate-300 px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                className={fieldClass}
               />
             </label>
             <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
@@ -811,7 +818,7 @@ export default function Home() {
                 value={totalMainKwh}
                 onChange={(event) => setTotalMainKwh(event.target.value)}
                 placeholder="0.00"
-                className="rounded-lg border border-slate-300 px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                className={fieldClass}
               />
             </label>
             <div className="rounded-xl bg-slate-50 px-4 py-3">
@@ -845,7 +852,7 @@ export default function Home() {
 
           <form
             onSubmit={(event) => void addExpense(event)}
-            className="mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_auto] sm:items-end"
+            className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_9rem_auto] md:items-end"
           >
             <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
               Description
@@ -853,7 +860,7 @@ export default function Home() {
                 value={description}
                 onChange={(event) => setDescription(event.target.value)}
                 placeholder="Repairs, supplies, utilities"
-                className="rounded-lg border border-slate-300 px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                className={fieldClass}
               />
             </label>
             <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
@@ -866,13 +873,13 @@ export default function Home() {
                 value={amount}
                 onChange={(event) => setAmount(event.target.value)}
                 placeholder="0.00"
-                className="rounded-lg border border-slate-300 px-3 py-2 font-normal text-slate-900 outline-none focus:border-slate-900"
+                className={fieldClass}
               />
             </label>
             <button
               type="submit"
               disabled={savingExpense}
-              className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+              className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
             >
               {savingExpense ? "Adding…" : "Add Expense"}
             </button>
@@ -917,8 +924,16 @@ export default function Home() {
   );
 }
 
-function formatMaybePeso(value: number | null) {
-  return value === null ? "—" : peso(value);
+function formatMaybePeso(value: number | null, wholeNumber = false) {
+  if (value === null) {
+    return "—";
+  }
+  if (wholeNumber) {
+    return `₱${Number(value.toFixed(0)).toLocaleString("en-PH", {
+      maximumFractionDigits: 0,
+    })}`;
+  }
+  return peso(value);
 }
 
 function MeterSummary({
@@ -940,10 +955,19 @@ function MeterSummary({
     currentReading !== "" &&
     Number.isFinite(previous) &&
     Number.isFinite(current);
-  const consumed = hasReadings ? Math.abs(previous - current) : null;
+  const rawConsumed = hasReadings ? Math.abs(previous - current) : null;
+  const roundsToWholePeso = baseRent === 5000;
+  const consumed =
+    rawConsumed === null
+      ? null
+      : roundsToWholePeso
+        ? Math.round(rawConsumed)
+        : rawConsumed;
   const electricityCharge =
     consumed !== null && rate !== null && Number.isFinite(rate)
-      ? consumed * rate
+      ? roundsToWholePeso
+        ? Number((consumed * rate).toFixed(0))
+        : consumed * rate
       : null;
   const totalAmountDue =
     electricityCharge === null ? null : baseRent + electricityCharge;
@@ -959,16 +983,22 @@ function MeterSummary({
       <div className="flex items-center justify-between gap-3">
         <dt className="text-slate-500">Consumed kWh</dt>
         <dd className="text-base font-semibold text-slate-900">
-          {consumed === null ? "—" : `${consumed.toLocaleString("en-PH")} kWh`}
+          {consumed === null
+            ? "—"
+            : `${roundsToWholePeso ? consumed.toFixed(0) : consumed.toLocaleString("en-PH")} kWh`}
         </dd>
       </div>
       <div className="flex items-center justify-between gap-3">
         <dt className="text-slate-500">Electricity Charge</dt>
-        <dd className="font-medium">{formatMaybePeso(electricityCharge)}</dd>
+        <dd className="font-medium">
+          {formatMaybePeso(electricityCharge, roundsToWholePeso)}
+        </dd>
       </div>
       <div className="flex items-center justify-between gap-3 border-t border-slate-200 pt-2">
         <dt className="font-medium text-slate-700">Total Amount Due</dt>
-        <dd className="font-semibold">{formatMaybePeso(totalAmountDue)}</dd>
+        <dd className="font-semibold">
+          {formatMaybePeso(totalAmountDue, roundsToWholePeso)}
+        </dd>
       </div>
     </dl>
   );
