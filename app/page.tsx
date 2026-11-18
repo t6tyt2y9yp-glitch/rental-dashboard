@@ -275,7 +275,7 @@ function mapPaymentHistory(
             (unitKey ? `Unit ${unitKey.slice(0, 8)}` : "Unknown unit"),
           paymentDate,
           baseRent: historyNumber(row.base_rent ?? row.baseRent),
-          consumedKwh: historyNumber(row.kwh_reading ?? row.consumed_kwh),
+          consumedKwh: historyNumber(row.consumed_kwh),
           totalPaid: historyNumber(row.total_due ?? row.totalPaid),
           receiptUrl: typeof row.receipt_url === "string" ? row.receipt_url : null,
           receivedBy:
@@ -292,6 +292,37 @@ function mapPaymentHistory(
         (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0)
       );
     });
+}
+
+function paymentsToLedger(
+  rows: PaymentRow[],
+  unitLabels: Map<string, string>,
+): LedgerEntry[] {
+  return mapPaymentHistory(rows, unitLabels).flatMap((record) => {
+    const source = rows.find((row) => String(row.id) === record.id);
+    const status = typeof source?.status === "string" ? source.status : "";
+    if (status !== "Paid" || record.baseRent === null || record.totalPaid === null) {
+      return [];
+    }
+
+    return [
+      {
+        id: record.id,
+        unitName: record.unitName,
+        totalPaid: record.totalPaid,
+        baseRent: record.baseRent,
+        consumedKwh: record.consumedKwh,
+        wholeNumber: record.baseRent === 5000,
+        datePaid: record.paymentDate ?? new Date().toISOString(),
+        paymentMethod:
+          typeof source?.payment_method === "string" && source.payment_method
+            ? source.payment_method
+            : "—",
+        receiptUrl: record.receiptUrl,
+        receivedBy: record.receivedBy ?? "—",
+      },
+    ];
+  });
 }
 
 function formatExpenseDate(value: string) {
@@ -520,7 +551,9 @@ export default function Home() {
       const mapped = mapUnits(unitRows ?? [], paymentRows ?? []).sort((a, b) =>
         a.label.localeCompare(b.label, undefined, { numeric: true }),
       );
+      const labels = new Map(mapped.map((unit) => [unit.id, unit.label]));
       setUnits(mapped);
+      setLedger(paymentsToLedger(paymentRows ?? [], labels));
       setLoadError(
         (unitRows?.length ?? 0) > 0 && mapped.length === 0
           ? "Units were found, but none have a base rent of ₱2,500, ₱3,000, or ₱5,000."
@@ -677,33 +710,17 @@ export default function Home() {
       return;
     }
 
-    const paymentIds = units
-      .map((unit) => unit.paymentId)
-      .filter((id): id is string => id !== null);
-
     setUnits((current) =>
       current.map((unit) => ({
         ...unit,
         previousReading: unit.currentReading,
         currentReading: "",
         paymentStatus: "Unpaid",
+        paymentId: null,
         receiptUrl: null,
         message: null,
       })),
     );
-
-    if (!supabase || paymentIds.length === 0) {
-      return;
-    }
-
-    const { error } = await supabase
-      .from("Payments")
-      .update({ status: "Unpaid" })
-      .in("id", paymentIds);
-
-    if (error) {
-      setLoadError(error.message);
-    }
   }
 
   async function changePaymentStatus(item: DashboardUnit, next: PaymentStatus) {
@@ -724,47 +741,26 @@ export default function Home() {
       : null;
 
     const receivedBy = markingPaid ? receivedByFromUserAgent() : null;
+    const consumedKwh = bill?.consumed == null ? null : Number(bill.consumed);
+    const totalPaid =
+      bill?.totalAmountDue == null ? item.baseRent : Number(bill.totalAmountDue);
 
-    if (supabase && item.paymentId) {
-      const { error } = await supabase
-        .from("Payments")
-        .update({
-          status: next,
-          ...(receivedBy ? { received_by: receivedBy } : {}),
-          ...(markingPaid && bill
-            ? {
-                base_rent: item.baseRent,
-                electricity_fee: bill.electricityCharge ?? 0,
-                kwh_reading: bill.consumed,
-                total_due: bill.totalAmountDue ?? item.baseRent,
-                receipt_url: item.receiptUrl,
-              }
-            : {}),
-        })
-        .eq("id", item.paymentId);
-
-      if (error) {
-        patchUnit(item.id, {
-          paymentStatus: item.paymentStatus,
-          message: error.message,
-        });
-        return;
-      }
-    } else if (supabase && markingPaid) {
+    if (supabase && markingPaid) {
       const { data, error } = await supabase
         .from("Payments")
         .insert({
           unit_id: item.id,
-          base_rent: item.baseRent,
-          electricity_fee: bill?.electricityCharge ?? 0,
-          kwh_reading: bill?.consumed ?? null,
-          total_due: bill?.totalAmountDue ?? item.baseRent,
+          base_rent: Number(item.baseRent),
+          electricity_fee:
+            bill?.electricityCharge == null ? 0 : Number(bill.electricityCharge),
+          consumed_kwh: consumedKwh,
+          total_due: totalPaid,
           status: "Paid",
           payment_method: item.paymentMethod || null,
           receipt_url: item.receiptUrl,
           received_by: receivedBy,
         })
-        .select("id")
+        .select("*")
         .single();
 
       if (error) {
@@ -779,24 +775,34 @@ export default function Home() {
         paymentId: String(data.id),
         paymentStatus: "Paid",
       });
+
+      if (item.paymentStatus === "Unpaid") {
+        const labels = new Map(
+          unitsRef.current.map((unit) => [unit.id, unit.label]),
+        );
+        const [entry] = paymentsToLedger([data], labels);
+        if (entry) {
+          setLedger((current) => [
+            entry,
+            ...current.filter((row) => row.id !== entry.id),
+          ]);
+        }
+      }
+      return;
     }
 
-    if (item.paymentStatus === "Unpaid" && markingPaid && bill) {
-      setLedger((current) => [
-        {
-          id: crypto.randomUUID(),
-          unitName: item.label,
-          totalPaid: bill.totalAmountDue ?? item.baseRent,
-          baseRent: item.baseRent,
-          consumedKwh: bill.consumed,
-          wholeNumber: item.baseRent === 5000,
-          datePaid: new Date().toISOString(),
-          paymentMethod: item.paymentMethod || "—",
-          receiptUrl: item.receiptUrl,
-          receivedBy: receivedBy ?? "Unknown Device",
-        },
-        ...current,
-      ]);
+    if (supabase && item.paymentId) {
+      const { error } = await supabase
+        .from("Payments")
+        .update({ status: next })
+        .eq("id", item.paymentId);
+
+      if (error) {
+        patchUnit(item.id, {
+          paymentStatus: item.paymentStatus,
+          message: error.message,
+        });
+      }
     }
   }
 
