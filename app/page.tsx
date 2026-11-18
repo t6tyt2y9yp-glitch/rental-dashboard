@@ -348,19 +348,27 @@ export default function Home() {
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [totalElectricityBill, setTotalElectricityBill] = useState("");
   const [totalMainKwh, setTotalMainKwh] = useState("");
+  const [electricityRateInput, setElectricityRateInput] = useState("");
   const [scanningReceipt, setScanningReceipt] = useState(false);
   const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
   const [receiptNoticeIsError, setReceiptNoticeIsError] = useState(false);
 
   const billAmount = Number(totalElectricityBill);
   const mainKwh = Number(totalMainKwh);
-  const electricityRate =
+  const calculatedRate =
     totalElectricityBill !== "" &&
     totalMainKwh !== "" &&
     Number.isFinite(billAmount) &&
     Number.isFinite(mainKwh) &&
     mainKwh > 0
       ? (billAmount / mainKwh).toFixed(2)
+      : null;
+  const parsedElectricityRate = Number(electricityRateInput);
+  const electricityRate =
+    electricityRateInput !== "" &&
+    Number.isFinite(parsedElectricityRate) &&
+    parsedElectricityRate >= 0
+      ? electricityRateInput
       : null;
 
   useEffect(() => {
@@ -781,40 +789,58 @@ export default function Home() {
   return (
     <div className="min-h-full bg-slate-100 text-slate-900">
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-5 py-6 sm:gap-8 sm:px-6 sm:py-8 lg:px-8">
+        <section
+          aria-label="Global controls"
+          className="flex flex-col gap-3 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <label className="flex w-full flex-col gap-1.5 text-sm font-medium text-slate-700 sm:flex-1">
+            Electricity Rate (₱ / kWh)
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              inputMode="decimal"
+              value={electricityRateInput}
+              onChange={(event) => setElectricityRateInput(event.target.value)}
+              placeholder="0.00"
+              className={`${fieldClass} sm:max-w-xs`}
+            />
+          </label>
+          <div className="flex flex-col gap-2 sm:flex-1 sm:flex-row sm:items-center sm:justify-center">
+            <label className={`${primaryButtonClass} cursor-pointer`}>
+              {scanningReceipt ? "Scanning…" : "Scan Global Receipt"}
+              <input
+                type="file"
+                accept="image/*"
+                disabled={scanningReceipt}
+                className="sr-only"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file) {
+                    void scanGlobalReceipt(file);
+                  }
+                }}
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => void startNewMonth()}
+              className={primaryButtonClass}
+            >
+              Start New Month
+            </button>
+          </div>
+          <div className="hidden sm:block sm:flex-1" aria-hidden="true" />
+        </section>
+
         <header className="flex flex-col gap-4">
           <p className="text-sm font-medium tracking-wide text-slate-500">
             Rental ledger
           </p>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
-              Units
-            </h1>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <label className={`${primaryButtonClass} cursor-pointer`}>
-                {scanningReceipt ? "Scanning…" : "Scan Global Receipt"}
-                <input
-                  type="file"
-                  accept="image/*"
-                  disabled={scanningReceipt}
-                  className="sr-only"
-                  onChange={(event) => {
-                    const file = event.target.files?.[0];
-                    event.target.value = "";
-                    if (file) {
-                      void scanGlobalReceipt(file);
-                    }
-                  }}
-                />
-              </label>
-              <button
-                type="button"
-                onClick={() => void startNewMonth()}
-                className={primaryButtonClass}
-              >
-                Start New Month
-              </button>
-            </div>
-          </div>
+          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+            Units
+          </h1>
           {receiptNotice ? (
             <p
               className={`rounded-xl px-4 py-3 text-sm ${
@@ -1062,7 +1088,7 @@ export default function Home() {
                 Active Rate
               </p>
               <p className="mt-1 text-lg font-semibold text-slate-900">
-                {electricityRate === null ? "—" : `₱${electricityRate} / kWh`}
+                {calculatedRate === null ? "—" : `₱${calculatedRate} / kWh`}
               </p>
             </div>
           </div>
