@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const RENT_TIERS = [2500, 3000, 5000] as const;
@@ -14,10 +14,8 @@ type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 
 type ReceiptExtraction = {
-  base_rent: number | null;
-  electricity_fee: number | null;
-  kwh_reading: number | null;
-  total_due: number | null;
+  unitName: string;
+  currentReading: number;
 };
 
 type DashboardUnit = {
@@ -30,8 +28,7 @@ type DashboardUnit = {
   paymentId: string | null;
   previousReading: string;
   currentReading: string;
-  extracting: boolean;
-  extraction: ReceiptExtraction | null;
+  receiptUrl: string | null;
   message: string | null;
 };
 
@@ -45,6 +42,7 @@ type LedgerEntry = {
   wholeNumber: boolean;
   datePaid: string;
   paymentMethod: string;
+  receiptUrl: string | null;
 };
 
 type MeterBill = {
@@ -173,8 +171,8 @@ function mapUnits(unitRows: UnitRow[], paymentRows: PaymentRow[]): DashboardUnit
             : String(payment.id),
         previousReading: "",
         currentReading: "",
-        extracting: false,
-        extraction: null,
+        receiptUrl:
+          typeof payment?.receipt_url === "string" ? payment.receipt_url : null,
         message: null,
       },
     ];
@@ -240,24 +238,105 @@ function formatExpenseDate(value: string) {
   });
 }
 
-function readFileAsDataUrl(file: File) {
+function unitNumberFromReceiptName(unitName: string) {
+  const trimmed = unitName.trim();
+  const labeled = /unit\s*(\d+)/i.exec(trimmed);
+  if (labeled) {
+    return labeled[1];
+  }
+  const leading = /^(\d+)/.exec(trimmed);
+  return leading?.[1] ?? null;
+}
+
+function findUnitByReceiptName(units: DashboardUnit[], unitName: string) {
+  const exact = unitName.trim().toLowerCase();
+  const byLabel = units.find((unit) => unit.label.trim().toLowerCase() === exact);
+  if (byLabel) {
+    return byLabel;
+  }
+
+  const number = unitNumberFromReceiptName(unitName);
+  if (!number) {
+    return null;
+  }
+
+  const target = `unit ${number}`;
+  return (
+    units.find((unit) => unit.label.trim().toLowerCase() === target) ?? null
+  );
+}
+
+function compressReceiptImage(file: File) {
   return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === "string") {
-        resolve(reader.result);
+    const objectUrl = URL.createObjectURL(file);
+    const image = new Image();
+
+    image.onload = () => {
+      const maxWidth = 1200;
+      const scale = image.width > maxWidth ? maxWidth / image.width : 1;
+      const width = Math.max(1, Math.round(image.width * scale));
+      const height = Math.max(1, Math.round(image.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+
+      if (!context) {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Could not compress that image."));
         return;
       }
+
+      context.drawImage(image, 0, 0, width, height);
+      URL.revokeObjectURL(objectUrl);
+      resolve(canvas.toDataURL("image/jpeg", 0.6));
+    };
+
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
       reject(new Error("Could not read that image."));
     };
-    reader.onerror = () => reject(new Error("Could not read that image."));
-    reader.readAsDataURL(file);
+
+    image.src = objectUrl;
   });
+}
+
+function dataUrlToBlob(dataUrl: string) {
+  const [header, data] = dataUrl.split(",");
+  const mimeType = /^data:([^;]+);base64$/i.exec(header)?.[1] ?? "image/jpeg";
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new Blob([bytes], { type: mimeType });
+}
+
+async function uploadReceiptImage(unitId: string, dataUrl: string) {
+  if (!supabase) {
+    throw new Error("Supabase is not configured.");
+  }
+
+  const path = `${unitId}/${crypto.randomUUID()}.jpg`;
+  const { error } = await supabase.storage.from("receipts").upload(path, dataUrlToBlob(dataUrl), {
+    contentType: "image/jpeg",
+    upsert: false,
+  });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return supabase.storage.from("receipts").getPublicUrl(path).data.publicUrl;
 }
 
 export default function Home() {
   const [activeTier, setActiveTier] = useState<RentTier>(2500);
   const [units, setUnits] = useState<DashboardUnit[]>([]);
+  const unitsRef = useRef(units);
+  unitsRef.current = units;
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expenses, setExpenses] = useState<Expense[]>([]);
@@ -269,6 +348,9 @@ export default function Home() {
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [totalElectricityBill, setTotalElectricityBill] = useState("");
   const [totalMainKwh, setTotalMainKwh] = useState("");
+  const [scanningReceipt, setScanningReceipt] = useState(false);
+  const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
+  const [receiptNoticeIsError, setReceiptNoticeIsError] = useState(false);
 
   const billAmount = Number(totalElectricityBill);
   const mainKwh = Number(totalMainKwh);
@@ -514,6 +596,7 @@ export default function Home() {
         previousReading: unit.currentReading,
         currentReading: "",
         paymentStatus: "Unpaid",
+        receiptUrl: null,
         message: null,
       })),
     );
@@ -539,10 +622,25 @@ export default function Home() {
 
     patchUnit(item.id, { paymentStatus: next, message: null });
 
+    const markingPaid = next === "Paid";
+    const bill = markingPaid
+      ? meterBill(
+          item.previousReading,
+          item.currentReading,
+          electricityRate,
+          item.baseRent,
+        )
+      : null;
+
     if (supabase && item.paymentId) {
       const { error } = await supabase
         .from("Payments")
-        .update({ status: next })
+        .update({
+          status: next,
+          ...(markingPaid && item.receiptUrl
+            ? { receipt_url: item.receiptUrl }
+            : {}),
+        })
         .eq("id", item.paymentId);
 
       if (error) {
@@ -552,15 +650,40 @@ export default function Home() {
         });
         return;
       }
+    } else if (supabase && markingPaid) {
+      const { data, error } = await supabase
+        .from("Payments")
+        .insert({
+          unit_id: item.id,
+          base_rent: item.baseRent,
+          electricity_fee: bill?.electricityCharge ?? 0,
+          kwh_reading:
+            item.currentReading === "" || !Number.isFinite(Number(item.currentReading))
+              ? null
+              : Number(item.currentReading),
+          total_due: bill?.totalAmountDue ?? item.baseRent,
+          status: "Paid",
+          payment_method: item.paymentMethod || null,
+          receipt_url: item.receiptUrl,
+        })
+        .select("id")
+        .single();
+
+      if (error) {
+        patchUnit(item.id, {
+          paymentStatus: item.paymentStatus,
+          message: error.message,
+        });
+        return;
+      }
+
+      patchUnit(item.id, {
+        paymentId: String(data.id),
+        paymentStatus: "Paid",
+      });
     }
 
-    if (item.paymentStatus === "Unpaid" && next === "Paid") {
-      const bill = meterBill(
-        item.previousReading,
-        item.currentReading,
-        electricityRate,
-        item.baseRent,
-      );
+    if (item.paymentStatus === "Unpaid" && markingPaid && bill) {
       setLedger((current) => [
         {
           id: crypto.randomUUID(),
@@ -569,25 +692,23 @@ export default function Home() {
           wholeNumber: item.baseRent === 5000,
           datePaid: new Date().toISOString(),
           paymentMethod: item.paymentMethod || "—",
+          receiptUrl: item.receiptUrl,
         },
         ...current,
       ]);
     }
   }
 
-  async function extractReceipt(item: DashboardUnit, file: File) {
-    patchUnit(item.id, {
-      extracting: true,
-      message: null,
-      extraction: null,
-    });
+  async function scanGlobalReceipt(file: File) {
+    setScanningReceipt(true);
+    setReceiptNotice(null);
 
     try {
-      const image = await readFileAsDataUrl(file);
+      const image = await compressReceiptImage(file);
       const response = await fetch("/api/extract-receipt", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image, mimeType: file.type }),
+        body: JSON.stringify({ image, mimeType: "image/jpeg" }),
       });
       const payload: unknown = await response.json();
 
@@ -603,27 +724,57 @@ export default function Home() {
       }
 
       const extraction = payload as ReceiptExtraction;
-      if (extraction.kwh_reading === null) {
-        patchUnit(item.id, {
-          extracting: false,
-          extraction,
-          message: "The receipt did not include a kWh reading.",
-        });
+      if (
+        typeof extraction.currentReading !== "number" ||
+        !Number.isFinite(extraction.currentReading)
+      ) {
+        throw new Error("The receipt did not include a kWh reading.");
+      }
+
+      const unitName =
+        typeof extraction.unitName === "string" ? extraction.unitName.trim() : "";
+      const matched = findUnitByReceiptName(unitsRef.current, unitName);
+
+      if (!matched) {
+        setReceiptNoticeIsError(true);
+        setReceiptNotice(
+          unitName
+            ? `No unit matches “${unitName}”.`
+            : "The receipt did not include a unit name.",
+        );
         return;
       }
 
-      patchUnit(item.id, {
-        extracting: false,
-        extraction,
-        currentReading: String(extraction.kwh_reading),
+      let receiptUrl: string | null = null;
+      let uploadMessage: string | null = null;
+      try {
+        receiptUrl = await uploadReceiptImage(matched.id, image);
+      } catch (error) {
+        uploadMessage =
+          error instanceof Error
+            ? error.message
+            : "Could not store the receipt image.";
+      }
+
+      patchUnit(matched.id, {
+        currentReading: String(extraction.currentReading),
+        receiptUrl,
         message: null,
       });
+      setActiveTier(matched.baseRent);
+      setReceiptNoticeIsError(uploadMessage !== null);
+      setReceiptNotice(
+        uploadMessage
+          ? `Set ${matched.label} current reading to ${extraction.currentReading.toLocaleString("en-PH")} kWh from “${unitName}”. The receipt image was not stored: ${uploadMessage}`
+          : `Set ${matched.label} current reading to ${extraction.currentReading.toLocaleString("en-PH")} kWh from “${unitName}”. Receipt image saved.`,
+      );
     } catch (error) {
-      patchUnit(item.id, {
-        extracting: false,
-        message:
-          error instanceof Error ? error.message : "Receipt extraction failed.",
-      });
+      setReceiptNoticeIsError(true);
+      setReceiptNotice(
+        error instanceof Error ? error.message : "Receipt extraction failed.",
+      );
+    } finally {
+      setScanningReceipt(false);
     }
   }
 
@@ -638,14 +789,43 @@ export default function Home() {
             <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
               Units
             </h1>
-            <button
-              type="button"
-              onClick={() => void startNewMonth()}
-              className={primaryButtonClass}
-            >
-              Start New Month
-            </button>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <label className={`${primaryButtonClass} cursor-pointer`}>
+                {scanningReceipt ? "Scanning…" : "Scan Global Receipt"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  disabled={scanningReceipt}
+                  className="sr-only"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) {
+                      void scanGlobalReceipt(file);
+                    }
+                  }}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => void startNewMonth()}
+                className={primaryButtonClass}
+              >
+                Start New Month
+              </button>
+            </div>
           </div>
+          {receiptNotice ? (
+            <p
+              className={`rounded-xl px-4 py-3 text-sm ${
+                receiptNoticeIsError
+                  ? "border border-rose-200 bg-rose-50 text-rose-800"
+                  : "border border-emerald-200 bg-emerald-50 text-emerald-800"
+              }`}
+            >
+              {receiptNotice}
+            </p>
+          ) : null}
           <p className="max-w-2xl text-sm leading-6 text-slate-600 sm:text-base">
             Filter by monthly rent, update occupancy, and read handwritten
             receipts for occupied units.
@@ -767,42 +947,24 @@ export default function Home() {
                   />
                 </label>
 
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                  <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-sm font-medium text-slate-700">
-                    Current kWh
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      inputMode="decimal"
-                      value={item.currentReading}
-                      onChange={(event) =>
-                        patchUnit(item.id, {
-                          currentReading: event.target.value,
-                          message: null,
-                        })
-                      }
-                      placeholder="Current kWh"
-                      className={fieldClass}
-                    />
-                  </label>
-                  <label className={`${primaryButtonClass} cursor-pointer sm:shrink-0`}>
-                    {item.extracting ? "Scanning…" : "Scan Receipt"}
-                    <input
-                      type="file"
-                      accept="image/*"
-                      disabled={item.extracting}
-                      className="sr-only"
-                      onChange={(event) => {
-                        const file = event.target.files?.[0];
-                        event.target.value = "";
-                        if (file) {
-                          void extractReceipt(item, file);
-                        }
-                      }}
-                    />
-                  </label>
-                </div>
+                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                  Current kWh
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    inputMode="decimal"
+                    value={item.currentReading}
+                    onChange={(event) =>
+                      patchUnit(item.id, {
+                        currentReading: event.target.value,
+                        message: null,
+                      })
+                    }
+                    placeholder="Current kWh"
+                    className={fieldClass}
+                  />
+                </label>
 
                 <MeterSummary
                   previousReading={item.previousReading}
@@ -1031,6 +1193,21 @@ export default function Home() {
                         <dt className="text-slate-500">Payment method</dt>
                         <dd className="font-medium">{entry.paymentMethod}</dd>
                       </div>
+                      {entry.receiptUrl ? (
+                        <div className="sm:col-span-2">
+                          <dt className="text-slate-500">Receipt</dt>
+                          <dd className="font-medium">
+                            <a
+                              href={entry.receiptUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-slate-900 underline"
+                            >
+                              View stored receipt
+                            </a>
+                          </dd>
+                        </div>
+                      ) : null}
                     </dl>
                   </li>
                 ))}
@@ -1127,8 +1304,10 @@ function MeterSummary({
         </dd>
       </div>
       <div className="flex items-center justify-between gap-3 border-t border-slate-200 pt-2">
-        <dt className="font-medium text-slate-700">Total Amount Due</dt>
-        <dd className="font-semibold">
+        <dt className="text-base font-semibold text-slate-900">
+          Total Amount Due (₱)
+        </dt>
+        <dd className="text-lg font-semibold text-slate-900">
           {formatMaybePeso(totalAmountDue, roundsToWholePeso)}
         </dd>
       </div>

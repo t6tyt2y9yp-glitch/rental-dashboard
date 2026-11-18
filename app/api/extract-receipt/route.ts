@@ -2,15 +2,18 @@ import { GoogleGenAI } from "@google/genai";
 
 const MODEL = "gemini-4-hydrogen";
 
-const SYSTEM_INSTRUCTION =
-  "Analyze this handwritten rent receipt or notebook ledger. Extract the base rent, electricity fee, kWh reading, and total amount. Return ONLY a raw JSON object with keys: base_rent, electricity_fee, kwh_reading, total_due. If a value is missing, use null.";
+const SYSTEM_INSTRUCTION = `Analyze this handwritten rent receipt or notebook ledger.
+Extract both of these values:
+1. unitName: the tenant or unit identifier, usually written next to "RECEIVED from". Copy it as written. Examples: "9N", "Unit 1", "Unit 9".
+2. currentReading: the current kWh reading. Examples: "666 Kwh", "666 kWh". Return only the number, without the unit.
+Return ONLY a raw JSON object with exactly two keys: "unitName" (string) and "currentReading" (number).
+Do not use markdown, code fences, or any other keys.
+If the unit identifier is missing, use an empty string. If the kWh reading is missing, use null.`;
 
-const RECEIPT_KEYS = [
-  "base_rent",
-  "electricity_fee",
-  "kwh_reading",
-  "total_due",
-] as const;
+type ReceiptExtraction = {
+  unitName: string;
+  currentReading: number;
+};
 
 const ALLOWED_MIME_TYPES = new Set([
   "image/jpeg",
@@ -22,9 +25,6 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-
-type ReceiptKey = (typeof RECEIPT_KEYS)[number];
-type ReceiptExtraction = Record<ReceiptKey, number | null>;
 
 function jsonError(message: string, status: number) {
   return Response.json({ error: message }, { status });
@@ -101,12 +101,19 @@ function parseReceipt(text: string): ReceiptExtraction {
   }
 
   const record = parsed as Record<string, unknown>;
-  return {
-    base_rent: toNullableNumber(record.base_rent),
-    electricity_fee: toNullableNumber(record.electricity_fee),
-    kwh_reading: toNullableNumber(record.kwh_reading),
-    total_due: toNullableNumber(record.total_due),
-  };
+  const unitName =
+    typeof record.unitName === "string"
+      ? record.unitName.trim()
+      : record.unitName == null
+        ? ""
+        : String(record.unitName).trim();
+  const currentReading = toNullableNumber(record.currentReading);
+
+  if (currentReading === null) {
+    throw new Error("The receipt did not include a kWh reading.");
+  }
+
+  return { unitName, currentReading };
 }
 
 function publicErrorMessage(error: unknown, apiKey: string) {
@@ -151,6 +158,17 @@ export async function POST(request: Request) {
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
         responseMimeType: "application/json",
+        responseJsonSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["unitName", "currentReading"],
+          properties: {
+            unitName: { type: "string" },
+            currentReading: {
+              anyOf: [{ type: "number" }, { type: "null" }],
+            },
+          },
+        },
       },
     });
 
