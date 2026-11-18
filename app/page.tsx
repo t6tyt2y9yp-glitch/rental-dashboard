@@ -39,10 +39,13 @@ type LedgerEntry = {
   id: string;
   unitName: string;
   totalPaid: number;
+  baseRent: number;
+  consumedKwh: number | null;
   wholeNumber: boolean;
   datePaid: string;
   paymentMethod: string;
   receiptUrl: string | null;
+  receivedBy: string;
 };
 
 type PaymentHistoryRecord = {
@@ -53,6 +56,7 @@ type PaymentHistoryRecord = {
   consumedKwh: number | null;
   totalPaid: number | null;
   receiptUrl: string | null;
+  receivedBy: string | null;
 };
 
 type MeterBill = {
@@ -274,6 +278,10 @@ function mapPaymentHistory(
           consumedKwh: historyNumber(row.kwh_reading ?? row.consumed_kwh),
           totalPaid: historyNumber(row.total_due ?? row.totalPaid),
           receiptUrl: typeof row.receipt_url === "string" ? row.receipt_url : null,
+          receivedBy:
+            typeof row.received_by === "string" && row.received_by.trim()
+              ? row.received_by.trim()
+              : null,
         },
       ];
     })
@@ -301,6 +309,24 @@ function formatExpenseDate(value: string) {
     month: "short",
     day: "numeric",
   });
+}
+
+function receivedByFromUserAgent(userAgent = navigator.userAgent) {
+  const agent = userAgent.toLowerCase();
+  if (
+    agent.includes("iphone") ||
+    agent.includes("ipad") ||
+    agent.includes("macintosh")
+  ) {
+    return "Kyle";
+  }
+  if (agent.includes("realme") || agent.includes("rmx")) {
+    return "[Friend 1 Name]";
+  }
+  if (agent.includes("vivo")) {
+    return "[Friend 2 Name]";
+  }
+  return "Unknown Device";
 }
 
 function findUnitByReceiptName(units: DashboardUnit[], unitName: string) {
@@ -403,10 +429,12 @@ export default function Home() {
   const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
   const [receiptNoticeIsError, setReceiptNoticeIsError] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [selectedUnitName, setSelectedUnitName] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [paymentHistory, setPaymentHistory] = useState<PaymentHistoryRecord[]>([]);
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
+  const [selectedLedgerEntry, setSelectedLedgerEntry] = useState<LedgerEntry | null>(null);
 
   const billAmount = Number(totalElectricityBill);
   const mainKwh = Number(totalMainKwh);
@@ -695,13 +723,22 @@ export default function Home() {
         )
       : null;
 
+    const receivedBy = markingPaid ? receivedByFromUserAgent() : null;
+
     if (supabase && item.paymentId) {
       const { error } = await supabase
         .from("Payments")
         .update({
           status: next,
-          ...(markingPaid && item.receiptUrl
-            ? { receipt_url: item.receiptUrl }
+          ...(receivedBy ? { received_by: receivedBy } : {}),
+          ...(markingPaid && bill
+            ? {
+                base_rent: item.baseRent,
+                electricity_fee: bill.electricityCharge ?? 0,
+                kwh_reading: bill.consumed,
+                total_due: bill.totalAmountDue ?? item.baseRent,
+                receipt_url: item.receiptUrl,
+              }
             : {}),
         })
         .eq("id", item.paymentId);
@@ -720,14 +757,12 @@ export default function Home() {
           unit_id: item.id,
           base_rent: item.baseRent,
           electricity_fee: bill?.electricityCharge ?? 0,
-          kwh_reading:
-            item.currentReading === "" || !Number.isFinite(Number(item.currentReading))
-              ? null
-              : Number(item.currentReading),
+          kwh_reading: bill?.consumed ?? null,
           total_due: bill?.totalAmountDue ?? item.baseRent,
           status: "Paid",
           payment_method: item.paymentMethod || null,
           receipt_url: item.receiptUrl,
+          received_by: receivedBy,
         })
         .select("id")
         .single();
@@ -752,10 +787,13 @@ export default function Home() {
           id: crypto.randomUUID(),
           unitName: item.label,
           totalPaid: bill.totalAmountDue ?? item.baseRent,
+          baseRent: item.baseRent,
+          consumedKwh: bill.consumed,
           wholeNumber: item.baseRent === 5000,
           datePaid: new Date().toISOString(),
           paymentMethod: item.paymentMethod || "—",
           receiptUrl: item.receiptUrl,
+          receivedBy: receivedBy ?? "Unknown Device",
         },
         ...current,
       ]);
@@ -841,7 +879,8 @@ export default function Home() {
     }
   }
 
-  async function openPaymentHistory() {
+  async function openPaymentHistory(unit: DashboardUnit) {
+    setSelectedUnitName(unit.label);
     setHistoryOpen(true);
     setReceiptPreview(null);
     setHistoryLoading(true);
@@ -853,18 +892,34 @@ export default function Home() {
       return;
     }
 
-    let { data, error } = await supabase
-      .from("Payments")
-      .select("*")
-      .order("payment_date", { ascending: false });
+    const unitLabels = new Map(
+      unitsRef.current.map((item) => [item.id, item.label]),
+    );
 
-    if (error && /payment_date/i.test(error.message)) {
-      const fallback = await supabase
+    async function loadPayments(
+      column: "unit_name" | "unit_id",
+      value: string,
+      orderColumn: "payment_date" | "created_at",
+    ) {
+      return supabase!
         .from("Payments")
         .select("*")
-        .order("created_at", { ascending: false });
-      data = fallback.data;
-      error = fallback.error;
+        .eq(column, value)
+        .order(orderColumn, { ascending: false });
+    }
+
+    let column: "unit_name" | "unit_id" = "unit_name";
+    let value = unit.label;
+    let { data, error } = await loadPayments(column, value, "payment_date");
+
+    if (error && /unit_name/i.test(error.message)) {
+      column = "unit_id";
+      value = unit.id;
+      ({ data, error } = await loadPayments(column, value, "payment_date"));
+    }
+
+    if (error && /payment_date/i.test(error.message)) {
+      ({ data, error } = await loadPayments(column, value, "created_at"));
     }
 
     if (error) {
@@ -874,9 +929,6 @@ export default function Home() {
       return;
     }
 
-    const unitLabels = new Map(
-      unitsRef.current.map((unit) => [unit.id, unit.label]),
-    );
     setPaymentHistory(mapPaymentHistory(data ?? [], unitLabels));
     setHistoryLoading(false);
   }
@@ -926,15 +978,7 @@ export default function Home() {
               Start New Month
             </button>
           </div>
-          <div className="flex sm:flex-1 sm:justify-end">
-            <button
-              type="button"
-              onClick={() => void openPaymentHistory()}
-              className={primaryButtonClass}
-            >
-              Payment History
-            </button>
-          </div>
+          <div className="hidden sm:block sm:flex-1" aria-hidden="true" />
         </section>
 
         <header className="flex flex-col gap-4">
@@ -1020,7 +1064,14 @@ export default function Home() {
             {visibleUnits.map((item) => (
               <article
                 key={item.id}
-                className="flex flex-col gap-4 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200"
+                onClick={(event) => {
+                  const target = event.target as HTMLElement;
+                  if (target.closest("input, select, textarea, button, a, label")) {
+                    return;
+                  }
+                  void openPaymentHistory(item);
+                }}
+                className="flex cursor-pointer flex-col gap-4 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 transition hover:ring-slate-400"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
@@ -1302,42 +1353,63 @@ export default function Home() {
             <div className="mt-5 max-h-80 overflow-y-auto rounded-xl border border-slate-100">
               <ul className="divide-y divide-slate-100">
                 {ledger.map((entry) => (
-                  <li key={entry.id} className="grid grid-cols-1 gap-2 px-4 py-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <p className="font-semibold text-slate-900">
-                        {entry.unitName}
-                      </p>
-                      <p className="font-semibold text-slate-900">
-                        {formatMaybePeso(entry.totalPaid, entry.wholeNumber)}
-                      </p>
-                    </div>
-                    <dl className="grid grid-cols-1 gap-1 text-sm sm:grid-cols-2">
-                      <div>
-                        <dt className="text-slate-500">Date paid</dt>
-                        <dd className="font-medium">
-                          {formatExpenseDate(entry.datePaid)}
-                        </dd>
+                  <li key={entry.id}>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedLedgerEntry(entry)}
+                      className="grid w-full grid-cols-1 gap-2 px-4 py-3 text-left hover:bg-slate-50"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="font-semibold text-slate-900">
+                          {entry.unitName}
+                        </p>
+                        <p className="font-semibold text-slate-900">
+                          {formatMaybePeso(entry.totalPaid, entry.wholeNumber)}
+                        </p>
                       </div>
-                      <div>
-                        <dt className="text-slate-500">Payment method</dt>
-                        <dd className="font-medium">{entry.paymentMethod}</dd>
-                      </div>
-                      {entry.receiptUrl ? (
-                        <div className="sm:col-span-2">
-                          <dt className="text-slate-500">Receipt</dt>
+                      <dl className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
+                        <div>
+                          <dt className="text-slate-500">Date paid</dt>
                           <dd className="font-medium">
-                            <a
-                              href={entry.receiptUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-slate-900 underline"
-                            >
-                              View stored receipt
-                            </a>
+                            {formatExpenseDate(entry.datePaid)}
                           </dd>
                         </div>
-                      ) : null}
-                    </dl>
+                        <div>
+                          <dt className="text-slate-500">Base rent</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(entry.baseRent ?? null, entry.wholeNumber)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Consumed kWh</dt>
+                          <dd className="font-medium">
+                            {entry.consumedKwh == null
+                              ? "—"
+                              : `${entry.consumedKwh.toLocaleString("en-PH")} kWh`}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Total amount paid</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(entry.totalPaid, entry.wholeNumber)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Payment method</dt>
+                          <dd className="font-medium">{entry.paymentMethod}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Received by</dt>
+                          <dd className="font-medium">{entry.receivedBy}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Receipt</dt>
+                          <dd className="font-medium">
+                            {entry.receiptUrl ? "Image attached" : "No receipt"}
+                          </dd>
+                        </div>
+                      </dl>
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -1346,6 +1418,94 @@ export default function Home() {
         </section>
 
       </main>
+
+      {selectedLedgerEntry ? (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 p-4 sm:items-center"
+          onClick={() => setSelectedLedgerEntry(null)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ledger-detail-title"
+            className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-lg"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 id="ledger-detail-title" className="text-xl font-semibold">
+                  {selectedLedgerEntry.unitName}
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  {formatExpenseDate(selectedLedgerEntry.datePaid)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedLedgerEntry(null)}
+                className={primaryButtonClass}
+              >
+                Close
+              </button>
+            </div>
+            <div className="mt-5 flex flex-col gap-4 sm:flex-row">
+              {selectedLedgerEntry.receiptUrl ? (
+                <button
+                  type="button"
+                  onClick={() => setReceiptPreview(selectedLedgerEntry.receiptUrl)}
+                  className="h-28 w-full overflow-hidden rounded-xl ring-1 ring-slate-200 sm:h-36 sm:w-36"
+                >
+                  <img
+                    src={selectedLedgerEntry.receiptUrl}
+                    alt={`Receipt for ${selectedLedgerEntry.unitName}`}
+                    className="h-full w-full object-cover"
+                  />
+                </button>
+              ) : (
+                <div className="flex h-28 w-full items-center justify-center rounded-xl bg-slate-50 text-sm text-slate-400 ring-1 ring-slate-200 sm:h-36 sm:w-36">
+                  No receipt
+                </div>
+              )}
+              <dl className="grid flex-1 grid-cols-1 gap-3 text-sm">
+                <div>
+                  <dt className="text-slate-500">Base rent</dt>
+                  <dd className="font-medium">
+                    {formatMaybePeso(
+                      selectedLedgerEntry.baseRent ?? null,
+                      selectedLedgerEntry.wholeNumber,
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Consumed kWh</dt>
+                  <dd className="font-medium">
+                    {selectedLedgerEntry.consumedKwh == null
+                      ? "—"
+                      : `${selectedLedgerEntry.consumedKwh.toLocaleString("en-PH")} kWh`}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Total amount paid</dt>
+                  <dd className="text-base font-semibold">
+                    {formatMaybePeso(
+                      selectedLedgerEntry.totalPaid,
+                      selectedLedgerEntry.wholeNumber,
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Received by</dt>
+                  <dd className="font-medium">{selectedLedgerEntry.receivedBy}</dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Payment method</dt>
+                  <dd className="font-medium">{selectedLedgerEntry.paymentMethod}</dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {historyOpen ? (
         <div
@@ -1368,10 +1528,10 @@ export default function Home() {
                   id="payment-history-title"
                   className="text-xl font-semibold tracking-tight"
                 >
-                  Payment History
+                  {selectedUnitName ?? "Payment History"}
                 </h2>
                 <p className="mt-1 text-sm text-slate-500">
-                  All payment records, newest first.
+                  Payment history for this unit, newest first.
                 </p>
               </div>
               <button
@@ -1394,7 +1554,7 @@ export default function Home() {
                 </p>
               ) : paymentHistory.length === 0 ? (
                 <p className="rounded-xl bg-white px-4 py-6 text-sm text-slate-500 ring-1 ring-slate-200">
-                  No payments recorded yet.
+                  No payments recorded for {selectedUnitName ?? "this unit"} yet.
                 </p>
               ) : (
                 <ul className="divide-y divide-slate-200 overflow-hidden rounded-2xl bg-white ring-1 ring-slate-200">
@@ -1455,6 +1615,10 @@ export default function Home() {
                             {formatMaybePeso(record.totalPaid)}
                           </dd>
                         </div>
+                        <div>
+                          <dt className="text-slate-500">Received by</dt>
+                          <dd className="font-medium">{record.receivedBy ?? "—"}</dd>
+                        </div>
                       </dl>
                     </li>
                   ))}
@@ -1462,21 +1626,18 @@ export default function Home() {
               )}
             </div>
           </div>
-          {receiptPreview ? (
-            <div
-              className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/80 p-5"
-              onClick={(event) => {
-                event.stopPropagation();
-                setReceiptPreview(null);
-              }}
-            >
-              <img
-                src={receiptPreview}
-                alt="Receipt"
-                className="max-h-full max-w-full rounded-lg object-contain"
-              />
-            </div>
-          ) : null}
+        </div>
+      ) : null}
+      {receiptPreview ? (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/80 p-5"
+          onClick={() => setReceiptPreview(null)}
+        >
+          <img
+            src={receiptPreview}
+            alt="Receipt"
+            className="max-h-full max-w-full rounded-lg object-contain"
+          />
         </div>
       ) : null}
     </div>
