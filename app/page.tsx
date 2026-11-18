@@ -38,6 +38,22 @@ type DashboardUnit = {
 type UnitRow = Record<string, unknown>;
 type PaymentRow = Record<string, unknown>;
 
+type LedgerEntry = {
+  id: string;
+  unitName: string;
+  totalPaid: number;
+  wholeNumber: boolean;
+  datePaid: string;
+  paymentMethod: string;
+};
+
+type MeterBill = {
+  consumed: number | null;
+  electricityCharge: number | null;
+  totalAmountDue: number | null;
+  roundsToWholePeso: boolean;
+};
+
 type Expense = {
   id: string;
   description: string;
@@ -250,6 +266,7 @@ export default function Home() {
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
   const [savingExpense, setSavingExpense] = useState(false);
+  const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [totalElectricityBill, setTotalElectricityBill] = useState("");
   const [totalMainKwh, setTotalMainKwh] = useState("");
 
@@ -515,6 +532,49 @@ export default function Home() {
     }
   }
 
+  async function changePaymentStatus(item: DashboardUnit, next: PaymentStatus) {
+    if (next === item.paymentStatus) {
+      return;
+    }
+
+    patchUnit(item.id, { paymentStatus: next, message: null });
+
+    if (supabase && item.paymentId) {
+      const { error } = await supabase
+        .from("Payments")
+        .update({ status: next })
+        .eq("id", item.paymentId);
+
+      if (error) {
+        patchUnit(item.id, {
+          paymentStatus: item.paymentStatus,
+          message: error.message,
+        });
+        return;
+      }
+    }
+
+    if (item.paymentStatus === "Unpaid" && next === "Paid") {
+      const bill = meterBill(
+        item.previousReading,
+        item.currentReading,
+        electricityRate,
+        item.baseRent,
+      );
+      setLedger((current) => [
+        {
+          id: crypto.randomUUID(),
+          unitName: item.label,
+          totalPaid: bill.totalAmountDue ?? item.baseRent,
+          wholeNumber: item.baseRent === 5000,
+          datePaid: new Date().toISOString(),
+          paymentMethod: item.paymentMethod || "—",
+        },
+        ...current,
+      ]);
+    }
+  }
+
   async function extractReceipt(item: DashboardUnit, file: File) {
     patchUnit(item.id, {
       extracting: true,
@@ -667,11 +727,25 @@ export default function Home() {
                       {peso(item.baseRent)} / month
                     </p>
                   </div>
-                  <span
-                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone(item.paymentStatus)}`}
-                  >
-                    {item.paymentStatus}
-                  </span>
+                  <label className="flex min-w-[8.5rem] flex-col gap-1 text-xs font-medium text-slate-500">
+                    Payment status
+                    <select
+                      value={item.paymentStatus}
+                      onChange={(event) =>
+                        void changePaymentStatus(
+                          item,
+                          event.target.value as PaymentStatus,
+                        )
+                      }
+                      className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
+                    >
+                      {PAYMENT_STATUSES.map((status) => (
+                        <option key={status} value={status}>
+                          {status}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                 </div>
 
                 <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
@@ -919,9 +993,89 @@ export default function Home() {
           )}
         </section>
 
+        <section className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:p-6">
+          <div>
+            <h2 className="text-xl font-semibold tracking-tight">
+              Payment Ledger
+            </h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Marking a unit Paid records it here. Starting a new month keeps
+              this history.
+            </p>
+          </div>
+          {ledger.length === 0 ? (
+            <p className="mt-5 rounded-xl bg-slate-50 px-4 py-6 text-sm text-slate-500">
+              No payments recorded yet.
+            </p>
+          ) : (
+            <div className="mt-5 max-h-80 overflow-y-auto rounded-xl border border-slate-100">
+              <ul className="divide-y divide-slate-100">
+                {ledger.map((entry) => (
+                  <li key={entry.id} className="grid grid-cols-1 gap-2 px-4 py-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <p className="font-semibold text-slate-900">
+                        {entry.unitName}
+                      </p>
+                      <p className="font-semibold text-slate-900">
+                        {formatMaybePeso(entry.totalPaid, entry.wholeNumber)}
+                      </p>
+                    </div>
+                    <dl className="grid grid-cols-1 gap-1 text-sm sm:grid-cols-2">
+                      <div>
+                        <dt className="text-slate-500">Date paid</dt>
+                        <dd className="font-medium">
+                          {formatExpenseDate(entry.datePaid)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-slate-500">Payment method</dt>
+                        <dd className="font-medium">{entry.paymentMethod}</dd>
+                      </div>
+                    </dl>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </section>
+
       </main>
     </div>
   );
+}
+
+function meterBill(
+  previousReading: string,
+  currentReading: string,
+  electricityRate: string | null,
+  baseRent: number,
+): MeterBill {
+  const previous = Number(previousReading);
+  const current = Number(currentReading);
+  const rate = electricityRate === null ? null : Number(electricityRate);
+  const hasReadings =
+    previousReading !== "" &&
+    currentReading !== "" &&
+    Number.isFinite(previous) &&
+    Number.isFinite(current);
+  const rawConsumed = hasReadings ? Math.abs(previous - current) : null;
+  const roundsToWholePeso = baseRent === 5000;
+  const consumed =
+    rawConsumed === null
+      ? null
+      : roundsToWholePeso
+        ? Math.round(rawConsumed)
+        : rawConsumed;
+  const electricityCharge =
+    consumed !== null && rate !== null && Number.isFinite(rate)
+      ? roundsToWholePeso
+        ? Number((consumed * rate).toFixed(0))
+        : consumed * rate
+      : null;
+  const totalAmountDue =
+    electricityCharge === null ? null : baseRent + electricityCharge;
+
+  return { consumed, electricityCharge, totalAmountDue, roundsToWholePeso };
 }
 
 function formatMaybePeso(value: number | null, wholeNumber = false) {
@@ -947,30 +1101,8 @@ function MeterSummary({
   electricityRate: string | null;
   baseRent: number;
 }) {
-  const previous = Number(previousReading);
-  const current = Number(currentReading);
-  const rate = electricityRate === null ? null : Number(electricityRate);
-  const hasReadings =
-    previousReading !== "" &&
-    currentReading !== "" &&
-    Number.isFinite(previous) &&
-    Number.isFinite(current);
-  const rawConsumed = hasReadings ? Math.abs(previous - current) : null;
-  const roundsToWholePeso = baseRent === 5000;
-  const consumed =
-    rawConsumed === null
-      ? null
-      : roundsToWholePeso
-        ? Math.round(rawConsumed)
-        : rawConsumed;
-  const electricityCharge =
-    consumed !== null && rate !== null && Number.isFinite(rate)
-      ? roundsToWholePeso
-        ? Number((consumed * rate).toFixed(0))
-        : consumed * rate
-      : null;
-  const totalAmountDue =
-    electricityCharge === null ? null : baseRent + electricityCharge;
+  const { consumed, electricityCharge, totalAmountDue, roundsToWholePeso } =
+    meterBill(previousReading, currentReading, electricityRate, baseRent);
 
   return (
     <dl className="grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
