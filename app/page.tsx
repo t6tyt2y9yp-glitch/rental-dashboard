@@ -45,6 +45,16 @@ type LedgerEntry = {
   receiptUrl: string | null;
 };
 
+type PaymentHistoryRecord = {
+  id: string;
+  unitName: string;
+  paymentDate: string | null;
+  baseRent: number | null;
+  consumedKwh: number | null;
+  totalPaid: number | null;
+  receiptUrl: string | null;
+};
+
 type MeterBill = {
   consumed: number | null;
   electricityCharge: number | null;
@@ -221,6 +231,61 @@ function mapExpense(row: Record<string, unknown>): Expense | null {
   };
 }
 
+function historyNumber(value: unknown) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function mapPaymentHistory(
+  rows: PaymentRow[],
+  unitLabels: Map<string, string>,
+): PaymentHistoryRecord[] {
+  return rows
+    .flatMap((row) => {
+      if (row.id === undefined || row.id === null) {
+        return [];
+      }
+      const unitId = row.unit_id ?? row.unitId;
+      const unitKey =
+        typeof unitId === "string" || typeof unitId === "number"
+          ? String(unitId)
+          : "";
+      const paymentDate =
+        typeof row.payment_date === "string"
+          ? row.payment_date
+          : typeof row.created_at === "string"
+            ? row.created_at
+            : null;
+
+      return [
+        {
+          id: String(row.id),
+          unitName:
+            unitLabels.get(unitKey) ??
+            (unitKey ? `Unit ${unitKey.slice(0, 8)}` : "Unknown unit"),
+          paymentDate,
+          baseRent: historyNumber(row.base_rent ?? row.baseRent),
+          consumedKwh: historyNumber(row.kwh_reading ?? row.consumed_kwh),
+          totalPaid: historyNumber(row.total_due ?? row.totalPaid),
+          receiptUrl: typeof row.receipt_url === "string" ? row.receipt_url : null,
+        },
+      ];
+    })
+    .sort((a, b) => {
+      const aTime = a.paymentDate ? Date.parse(a.paymentDate) : 0;
+      const bTime = b.paymentDate ? Date.parse(b.paymentDate) : 0;
+      return (
+        (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0)
+      );
+    });
+}
+
 function formatExpenseDate(value: string) {
   if (!value) {
     return "—";
@@ -238,31 +303,16 @@ function formatExpenseDate(value: string) {
   });
 }
 
-function unitNumberFromReceiptName(unitName: string) {
-  const trimmed = unitName.trim();
-  const labeled = /unit\s*(\d+)/i.exec(trimmed);
-  if (labeled) {
-    return labeled[1];
-  }
-  const leading = /^(\d+)/.exec(trimmed);
-  return leading?.[1] ?? null;
-}
-
 function findUnitByReceiptName(units: DashboardUnit[], unitName: string) {
-  const exact = unitName.trim().toLowerCase();
-  const byLabel = units.find((unit) => unit.label.trim().toLowerCase() === exact);
-  if (byLabel) {
-    return byLabel;
-  }
-
-  const number = unitNumberFromReceiptName(unitName);
-  if (!number) {
+  const exact = unitName.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!exact) {
     return null;
   }
 
-  const target = `unit ${number}`;
   return (
-    units.find((unit) => unit.label.trim().toLowerCase() === target) ?? null
+    units.find(
+      (unit) => unit.label.trim().toLowerCase().replace(/\s+/g, " ") === exact,
+    ) ?? null
   );
 }
 
@@ -352,6 +402,11 @@ export default function Home() {
   const [scanningReceipt, setScanningReceipt] = useState(false);
   const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
   const [receiptNoticeIsError, setReceiptNoticeIsError] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [paymentHistory, setPaymentHistory] = useState<PaymentHistoryRecord[]>([]);
+  const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
 
   const billAmount = Number(totalElectricityBill);
   const mainKwh = Number(totalMainKwh);
@@ -786,6 +841,46 @@ export default function Home() {
     }
   }
 
+  async function openPaymentHistory() {
+    setHistoryOpen(true);
+    setReceiptPreview(null);
+    setHistoryLoading(true);
+    setHistoryError(null);
+
+    if (!supabase) {
+      setHistoryError("Supabase is not configured.");
+      setHistoryLoading(false);
+      return;
+    }
+
+    let { data, error } = await supabase
+      .from("Payments")
+      .select("*")
+      .order("payment_date", { ascending: false });
+
+    if (error && /payment_date/i.test(error.message)) {
+      const fallback = await supabase
+        .from("Payments")
+        .select("*")
+        .order("created_at", { ascending: false });
+      data = fallback.data;
+      error = fallback.error;
+    }
+
+    if (error) {
+      setHistoryError(error.message);
+      setPaymentHistory([]);
+      setHistoryLoading(false);
+      return;
+    }
+
+    const unitLabels = new Map(
+      unitsRef.current.map((unit) => [unit.id, unit.label]),
+    );
+    setPaymentHistory(mapPaymentHistory(data ?? [], unitLabels));
+    setHistoryLoading(false);
+  }
+
   return (
     <div className="min-h-full bg-slate-100 text-slate-900">
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-5 py-6 sm:gap-8 sm:px-6 sm:py-8 lg:px-8">
@@ -831,7 +926,15 @@ export default function Home() {
               Start New Month
             </button>
           </div>
-          <div className="hidden sm:block sm:flex-1" aria-hidden="true" />
+          <div className="flex sm:flex-1 sm:justify-end">
+            <button
+              type="button"
+              onClick={() => void openPaymentHistory()}
+              className={primaryButtonClass}
+            >
+              Payment History
+            </button>
+          </div>
         </section>
 
         <header className="flex flex-col gap-4">
@@ -1243,6 +1346,139 @@ export default function Home() {
         </section>
 
       </main>
+
+      {historyOpen ? (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/40"
+          onClick={() => {
+            setReceiptPreview(null);
+            setHistoryOpen(false);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="payment-history-title"
+            className="flex h-full w-full flex-col bg-slate-100"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-5 py-4">
+              <div>
+                <h2
+                  id="payment-history-title"
+                  className="text-xl font-semibold tracking-tight"
+                >
+                  Payment History
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  All payment records, newest first.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setReceiptPreview(null);
+                  setHistoryOpen(false);
+                }}
+                className={primaryButtonClass}
+              >
+                Close
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-4">
+              {historyLoading ? (
+                <div className="h-24 animate-pulse rounded-xl bg-white" />
+              ) : historyError ? (
+                <p className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+                  {historyError}
+                </p>
+              ) : paymentHistory.length === 0 ? (
+                <p className="rounded-xl bg-white px-4 py-6 text-sm text-slate-500 ring-1 ring-slate-200">
+                  No payments recorded yet.
+                </p>
+              ) : (
+                <ul className="divide-y divide-slate-200 overflow-hidden rounded-2xl bg-white ring-1 ring-slate-200">
+                  {paymentHistory.map((record) => (
+                    <li
+                      key={record.id}
+                      className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center"
+                    >
+                      {record.receiptUrl ? (
+                        <button
+                          type="button"
+                          onClick={() => setReceiptPreview(record.receiptUrl)}
+                          className="h-16 w-16 shrink-0 overflow-hidden rounded-lg ring-1 ring-slate-200"
+                        >
+                          <img
+                            src={record.receiptUrl}
+                            alt={`Receipt for ${record.unitName}`}
+                            className="h-full w-full object-cover"
+                          />
+                        </button>
+                      ) : (
+                        <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-lg bg-slate-50 text-center text-xs text-slate-400 ring-1 ring-slate-200">
+                          No receipt
+                        </div>
+                      )}
+                      <dl className="grid flex-1 grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-5">
+                        <div>
+                          <dt className="text-slate-500">Unit name</dt>
+                          <dd className="font-semibold text-slate-900">
+                            {record.unitName}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Payment date</dt>
+                          <dd className="font-medium">
+                            {record.paymentDate
+                              ? formatExpenseDate(record.paymentDate)
+                              : "—"}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Base rent</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(record.baseRent)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Consumed kWh</dt>
+                          <dd className="font-medium">
+                            {record.consumedKwh === null
+                              ? "—"
+                              : `${record.consumedKwh.toLocaleString("en-PH")} kWh`}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Total amount paid</dt>
+                          <dd className="font-semibold text-slate-900">
+                            {formatMaybePeso(record.totalPaid)}
+                          </dd>
+                        </div>
+                      </dl>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+          {receiptPreview ? (
+            <div
+              className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/80 p-5"
+              onClick={(event) => {
+                event.stopPropagation();
+                setReceiptPreview(null);
+              }}
+            >
+              <img
+                src={receiptPreview}
+                alt="Receipt"
+                className="max-h-full max-w-full rounded-lg object-contain"
+              />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
