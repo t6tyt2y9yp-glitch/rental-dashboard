@@ -203,16 +203,6 @@ function statusTone(status: PaymentStatus) {
   return "bg-red-50 text-red-700 ring-red-200";
 }
 
-function statusDot(status: PaymentStatus) {
-  if (status === "Paid") {
-    return "bg-green-500";
-  }
-  if (status === "Partial") {
-    return "bg-yellow-400";
-  }
-  return "bg-red-500";
-}
-
 function mapExpense(row: Record<string, unknown>): Expense | null {
   if (row.id === undefined || row.id === null) {
     return null;
@@ -453,13 +443,12 @@ export default function Home() {
   const [amount, setAmount] = useState("");
   const [savingExpense, setSavingExpense] = useState(false);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
-  const [totalElectricityBill, setTotalElectricityBill] = useState("");
-  const [totalMainKwh, setTotalMainKwh] = useState("");
   const [electricityRateInput, setElectricityRateInput] = useState("");
   const [scanningReceipt, setScanningReceipt] = useState(false);
   const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
   const [receiptNoticeIsError, setReceiptNoticeIsError] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [openUnitIds, setOpenUnitIds] = useState<Record<string, boolean>>({});
   const [selectedUnitName, setSelectedUnitName] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -467,16 +456,6 @@ export default function Home() {
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
   const [selectedLedgerEntry, setSelectedLedgerEntry] = useState<LedgerEntry | null>(null);
 
-  const billAmount = Number(totalElectricityBill);
-  const mainKwh = Number(totalMainKwh);
-  const calculatedRate =
-    totalElectricityBill !== "" &&
-    totalMainKwh !== "" &&
-    Number.isFinite(billAmount) &&
-    Number.isFinite(mainKwh) &&
-    mainKwh > 0
-      ? (billAmount / mainKwh).toFixed(2)
-      : null;
   const parsedElectricityRate = Number(electricityRateInput);
   const electricityRate =
     electricityRateInput !== "" &&
@@ -1067,192 +1046,204 @@ export default function Home() {
           </p>
         ) : (
           <section className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {visibleUnits.map((item) => (
+            {visibleUnits.map((item) => {
+              const expanded = openUnitIds[item.id] === true;
+              const bill = meterBill(
+                item.previousReading,
+                item.currentReading,
+                electricityRate,
+                item.baseRent,
+              );
+              return (
               <article
                 key={item.id}
-                onClick={(event) => {
-                  const target = event.target as HTMLElement;
-                  if (target.closest("input, select, textarea, button, a, label")) {
-                    return;
-                  }
-                  void openPaymentHistory(item);
-                }}
-                className="flex cursor-pointer flex-col gap-4 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 transition hover:ring-slate-400"
+                className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200"
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`h-3 w-3 shrink-0 rounded-full ${statusDot(item.paymentStatus)}`}
-                      title={item.paymentStatus}
-                      aria-label={`${item.label} payment status: ${item.paymentStatus}`}
+                <button
+                  type="button"
+                  aria-expanded={expanded}
+                  onClick={() =>
+                    setOpenUnitIds((current) => ({
+                      ...current,
+                      [item.id]: !current[item.id],
+                    }))
+                  }
+                  className="flex w-full items-center gap-3 px-4 py-3 text-left"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h2 className="text-lg font-semibold">{item.label}</h2>
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone(item.paymentStatus)}`}
+                      >
+                        {item.paymentStatus}
+                      </span>
+                      <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
+                        {item.status}
+                      </span>
+                    </div>
+                  </div>
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    className={`h-5 w-5 shrink-0 text-slate-500 transition-transform duration-300 ${expanded ? "rotate-180" : ""}`}
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.17l3.71-3.94a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z"
+                      clipRule="evenodd"
                     />
-                    <h2 className="text-lg font-semibold">{item.label}</h2>
+                  </svg>
+                </button>
+                <div
+                  className={`grid transition-all duration-300 ease-in-out ${expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"}`}
+                >
+                  <div className="overflow-hidden" inert={expanded ? undefined : true}>
+                    <div className="flex flex-col gap-4 px-4 pb-4">
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Previous kWh
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          inputMode="decimal"
+                          value={item.previousReading}
+                          onChange={(event) =>
+                            patchUnit(item.id, {
+                              previousReading: event.target.value,
+                              message: null,
+                            })
+                          }
+                          placeholder="Previous kWh"
+                          className={fieldClass}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Current kWh
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          inputMode="decimal"
+                          value={item.currentReading}
+                          onChange={(event) =>
+                            patchUnit(item.id, {
+                              currentReading: event.target.value,
+                              message: null,
+                            })
+                          }
+                          placeholder="Current kWh"
+                          className={fieldClass}
+                        />
+                      </label>
+                      <dl className="grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
+                        <div className="flex items-center justify-between gap-3">
+                          <dt className="text-slate-500">Consumed kWh</dt>
+                          <dd className="font-semibold text-slate-900">
+                            {bill.consumed === null
+                              ? "—"
+                              : `${bill.roundsToWholePeso ? bill.consumed.toFixed(0) : bill.consumed.toLocaleString("en-PH")} kWh`}
+                          </dd>
+                        </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <dt className="text-slate-500">Electricity Charge</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(bill.electricityCharge, bill.roundsToWholePeso)}
+                          </dd>
+                        </div>
+                      </dl>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Payment status
+                        <select
+                          value={item.paymentStatus}
+                          onChange={(event) =>
+                            void changePaymentStatus(
+                              item,
+                              event.target.value as PaymentStatus,
+                            )
+                          }
+                          className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
+                        >
+                          {PAYMENT_STATUSES.map((status) => (
+                            <option key={status} value={status}>
+                              {status}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Unit status
+                        <select
+                          value={item.status}
+                          onChange={(event) =>
+                            void changeStatus(item, event.target.value as UnitStatus)
+                          }
+                          className={fieldClass}
+                        >
+                          {UNIT_STATUSES.map((status) => (
+                            <option key={status} value={status}>
+                              {status}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Payment method
+                        <select
+                          value={item.paymentMethod}
+                          onChange={(event) =>
+                            void changeMethod(
+                              item,
+                              event.target.value as PaymentMethod,
+                            )
+                          }
+                          className={fieldClass}
+                        >
+                          <option value="" disabled>
+                            Choose method
+                          </option>
+                          {PAYMENT_METHODS.map((method) => (
+                            <option key={method} value={method}>
+                              {method}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        <button
+                          type="button"
+                          disabled={item.paymentStatus === "Paid"}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void changePaymentStatus(item, "Paid");
+                          }}
+                          className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+                        >
+                          Mark as Paid
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void openPaymentHistory(item);
+                          }}
+                          className={primaryButtonClass}
+                        >
+                          View History
+                        </button>
+                      </div>
+                      {item.message ? (
+                        <p className="text-sm text-rose-700">{item.message}</p>
+                      ) : null}
+                    </div>
                   </div>
-                    <p className="text-sm text-slate-500">
-                      {peso(item.baseRent)} / month
-                    </p>
-                  </div>
-                  <label className="flex min-w-[8.5rem] flex-col gap-1 text-xs font-medium text-slate-500">
-                    Payment status
-                    <select
-                      value={item.paymentStatus}
-                      onChange={(event) =>
-                        void changePaymentStatus(
-                          item,
-                          event.target.value as PaymentStatus,
-                        )
-                      }
-                      className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
-                    >
-                      {PAYMENT_STATUSES.map((status) => (
-                        <option key={status} value={status}>
-                          {status}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
                 </div>
-
-                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                  Previous kWh
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    inputMode="decimal"
-                    value={item.previousReading}
-                    onChange={(event) =>
-                      patchUnit(item.id, {
-                        previousReading: event.target.value,
-                        message: null,
-                      })
-                    }
-                    placeholder="Previous kWh"
-                    className={fieldClass}
-                  />
-                </label>
-
-                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                  Current kWh
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    inputMode="decimal"
-                    value={item.currentReading}
-                    onChange={(event) =>
-                      patchUnit(item.id, {
-                        currentReading: event.target.value,
-                        message: null,
-                      })
-                    }
-                    placeholder="Current kWh"
-                    className={fieldClass}
-                  />
-                </label>
-
-                <MeterSummary
-                  previousReading={item.previousReading}
-                  currentReading={item.currentReading}
-                  electricityRate={electricityRate}
-                  baseRent={item.baseRent}
-                />
-
-                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                  Unit status
-                  <select
-                    value={item.status}
-                    onChange={(event) =>
-                      void changeStatus(item, event.target.value as UnitStatus)
-                    }
-                    className={fieldClass}
-                  >
-                    {UNIT_STATUSES.map((status) => (
-                      <option key={status} value={status}>
-                        {status}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                  Payment method
-                  <select
-                    value={item.paymentMethod}
-                    onChange={(event) =>
-                      void changeMethod(
-                        item,
-                        event.target.value as PaymentMethod,
-                      )
-                    }
-                    className={fieldClass}
-                  >
-                    <option value="" disabled>
-                      Choose method
-                    </option>
-                    {PAYMENT_METHODS.map((method) => (
-                      <option key={method} value={method}>
-                        {method}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                {item.message ? (
-                  <p className="text-sm text-rose-700">{item.message}</p>
-                ) : null}
               </article>
-            ))}
+              );
+            })}
           </section>
         )}
-
-        <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
-          <div>
-            <h2 className="text-xl font-semibold tracking-tight">
-              Electricity Rate Calculator
-            </h2>
-            <p className="mt-1 text-sm text-slate-500">
-              Divide the main bill by total kWh to get the active rate.
-            </p>
-          </div>
-          <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-end">
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-              Total bill
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                inputMode="decimal"
-                value={totalElectricityBill}
-                onChange={(event) => setTotalElectricityBill(event.target.value)}
-                placeholder="0.00"
-                className={fieldClass}
-              />
-            </label>
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-              Total kWh
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                inputMode="decimal"
-                value={totalMainKwh}
-                onChange={(event) => setTotalMainKwh(event.target.value)}
-                placeholder="0.00"
-                className={fieldClass}
-              />
-            </label>
-            <div className="rounded-xl bg-slate-50 px-4 py-3">
-              <p className="text-xs font-medium tracking-wide text-slate-500">
-                Active Rate
-              </p>
-              <p className="mt-1 text-lg font-semibold text-slate-900">
-                {calculatedRate === null ? "—" : `₱${calculatedRate} / kWh`}
-              </p>
-            </div>
-          </div>
-        </section>
 
         <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
@@ -1694,52 +1685,4 @@ function formatMaybePeso(value: number | null, wholeNumber = false) {
     })}`;
   }
   return peso(value);
-}
-
-function MeterSummary({
-  previousReading,
-  currentReading,
-  electricityRate,
-  baseRent,
-}: {
-  previousReading: string;
-  currentReading: string;
-  electricityRate: string | null;
-  baseRent: number;
-}) {
-  const { consumed, electricityCharge, totalAmountDue, roundsToWholePeso } =
-    meterBill(previousReading, currentReading, electricityRate, baseRent);
-
-  return (
-    <dl className="grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
-      <div className="flex items-center justify-between gap-3">
-        <dt className="text-slate-500">Current kWh</dt>
-        <dd className="text-base font-semibold text-slate-900">
-          {currentReading === "" ? "—" : `${Number(currentReading).toLocaleString("en-PH")} kWh`}
-        </dd>
-      </div>
-      <div className="flex items-center justify-between gap-3">
-        <dt className="text-slate-500">Consumed kWh</dt>
-        <dd className="text-base font-semibold text-slate-900">
-          {consumed === null
-            ? "—"
-            : `${roundsToWholePeso ? consumed.toFixed(0) : consumed.toLocaleString("en-PH")} kWh`}
-        </dd>
-      </div>
-      <div className="flex items-center justify-between gap-3">
-        <dt className="text-slate-500">Electricity Charge</dt>
-        <dd className="font-medium">
-          {formatMaybePeso(electricityCharge, roundsToWholePeso)}
-        </dd>
-      </div>
-      <div className="flex items-center justify-between gap-3 border-t border-slate-200 pt-2">
-        <dt className="text-base font-semibold text-slate-900">
-          Total Amount Due (₱)
-        </dt>
-        <dd className="text-lg font-semibold text-slate-900">
-          {formatMaybePeso(totalAmountDue, roundsToWholePeso)}
-        </dd>
-      </div>
-    </dl>
-  );
 }
