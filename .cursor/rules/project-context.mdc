@@ -1,0 +1,39 @@
+---
+description: External Supabase storage, receipt retention, and Payments columns
+alwaysApply: true
+---
+
+# Supabase project context
+
+Receipt images and the payment ledger live in the external Supabase project. Do not assume a local database.
+
+## Storage
+
+- Public bucket name: `receipts`.
+- RLS allows public `INSERT` and `SELECT` on that bucket.
+- A Supabase SQL trigger or schedule deletes objects in `receipts` after 4 months. Deletion is rolling, based on each image's age.
+- That job removes the image only. It must not delete or alter rows in `Payments`.
+
+## Payments columns
+
+`Payments` keeps the permanent ledger. Relevant columns:
+
+- `receipt_url` — public URL of the compressed receipt in `receipts`. It can later 404 after the 4-month cleanup.
+- `consumed_kwh` — static kWh saved when the payment was marked paid. Do not recompute it from current unit readings.
+- `received_by` — person who logged the payment.
+
+## Expired receipt images
+
+Any UI that renders `receipt_url` must handle a missing or broken image. On load error, or when the URL is empty, show the text **Image archived/expired** instead of a broken image.
+
+```tsx
+const [expired, setExpired] = useState(false);
+
+if (!receiptUrl || expired) {
+  return <span>Image archived/expired</span>;
+}
+
+return (
+  <img src={receiptUrl} alt="Receipt" onError={() => setExpired(true)} />
+);
+```
