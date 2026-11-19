@@ -23,9 +23,13 @@ type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 
 type ReceiptExtraction = {
-  unitName: string;
-  currentReading: number;
-  amountPaid?: number | null;
+  unit: string;
+  current_kwh: number | null;
+  payment_date: string | null;
+  rent_paid: number | null;
+  electricity_paid: number | null;
+  billing_period: string | null;
+  total_paid: number | null;
 };
 
 type DashboardUnit = {
@@ -38,6 +42,10 @@ type DashboardUnit = {
   paymentId: string | null;
   previousReading: string;
   currentReading: string;
+  paymentDate: string;
+  billingPeriod: string;
+  rentPaid: string;
+  electricityPaid: string;
   amountPaid: string;
   balance: number;
   receiptUrl: string | null;
@@ -52,9 +60,12 @@ type LedgerEntry = {
   unitName: string;
   totalPaid: number;
   baseRent: number;
+  rentPaid: number | null;
   consumedKwh: number | null;
   electricityRate: number | null;
   electricityCharge: number | null;
+  billingPeriod: string | null;
+  amountPaid: number | null;
   wholeNumber: boolean;
   datePaid: string;
   paymentMethod: string;
@@ -67,9 +78,12 @@ type PaymentHistoryRecord = {
   unitName: string;
   paymentDate: string | null;
   baseRent: number | null;
+  rentPaid: number | null;
   consumedKwh: number | null;
   electricityRate: number | null;
   electricityCharge: number | null;
+  billingPeriod: string | null;
+  amountPaid: number | null;
   totalPaid: number | null;
   receiptUrl: string | null;
   receivedBy: string | null;
@@ -213,6 +227,10 @@ function mapUnits(unitRows: UnitRow[], paymentRows: PaymentRow[]): DashboardUnit
             : String(payment.id),
         previousReading: "",
         currentReading: "",
+        paymentDate: "",
+        billingPeriod: "",
+        rentPaid: "",
+        electricityPaid: "",
         amountPaid: "",
         balance: asBalance(row.balance),
         receiptUrl:
@@ -317,6 +335,11 @@ function mapPaymentHistory(
             ? row.created_at
             : null;
 
+      const billingPeriod =
+        typeof row.billing_period === "string" && row.billing_period.trim()
+          ? row.billing_period.trim()
+          : null;
+
       return [
         {
           id: String(row.id),
@@ -325,12 +348,17 @@ function mapPaymentHistory(
             (unitKey ? `Unit ${unitKey.slice(0, 8)}` : "Unknown unit"),
           paymentDate,
           baseRent: historyNumber(row.base_rent ?? row.baseRent),
+          rentPaid: historyNumber(row.rent_paid),
           consumedKwh: historyNumber(row.consumed_kwh),
           electricityRate: historyNumber(row.electricity_rate),
           electricityCharge: historyNumber(
             row.electricity_charge ?? row.electricity_fee,
           ),
-          totalPaid: historyNumber(row.total_due ?? row.totalPaid),
+          billingPeriod,
+          amountPaid: historyNumber(row.amount_paid),
+          totalPaid: historyNumber(
+            row.amount_paid ?? row.total_due ?? row.totalPaid,
+          ),
           receiptUrl: typeof row.receipt_url === "string" ? row.receipt_url : null,
           receivedBy:
             typeof row.received_by === "string" && row.received_by.trim()
@@ -365,9 +393,12 @@ function paymentsToLedger(
         unitName: record.unitName,
         totalPaid: record.totalPaid,
         baseRent: record.baseRent,
+        rentPaid: record.rentPaid,
         consumedKwh: record.consumedKwh,
         electricityRate: record.electricityRate,
         electricityCharge: record.electricityCharge,
+        billingPeriod: record.billingPeriod,
+        amountPaid: record.amountPaid,
         wholeNumber: record.baseRent === 5000,
         datePaid: record.paymentDate ?? new Date().toISOString(),
         paymentMethod:
@@ -974,6 +1005,11 @@ export default function Home() {
         ...unit,
         previousReading: unit.currentReading,
         currentReading: "",
+        paymentDate: "",
+        billingPeriod: "",
+        rentPaid: "",
+        electricityPaid: "",
+        amountPaid: "",
         paymentStatus: "Unpaid",
         paymentId: null,
         receiptUrl: null,
@@ -1006,18 +1042,36 @@ export default function Home() {
       electricityRate !== null && Number.isFinite(Number(electricityRate))
         ? Number(electricityRate)
         : null;
-    const electricityChargeSnapshot =
+    const scannedElectricity = Number(item.electricityPaid);
+    const hasScannedElectricity =
+      item.electricityPaid.trim() !== "" && Number.isFinite(scannedElectricity);
+    const calculatedElectricity =
       consumedKwh != null && rateSnapshot != null
         ? Number((consumedKwh * rateSnapshot).toFixed(bill?.roundsToWholePeso ? 0 : 2))
         : bill?.electricityCharge == null
           ? null
           : Number(bill.electricityCharge);
+    const electricityChargeSnapshot = hasScannedElectricity
+      ? scannedElectricity
+      : calculatedElectricity;
+    const scannedRent = Number(item.rentPaid);
+    const rentPaidSnapshot =
+      item.rentPaid.trim() !== "" && Number.isFinite(scannedRent)
+        ? scannedRent
+        : Number(item.baseRent);
     const totalDue =
       bill?.totalAmountDue == null
         ? item.baseRent + item.balance
         : Number(bill.totalAmountDue);
-    const amountPaid = totalDue;
+    const scannedTotal = Number(item.amountPaid);
+    const amountPaid =
+      item.amountPaid.trim() !== "" && Number.isFinite(scannedTotal)
+        ? scannedTotal
+        : totalDue;
     const nextBalance = Math.max(0, totalDue - amountPaid);
+    const paymentDate =
+      item.paymentDate.trim() || new Date().toISOString().slice(0, 10);
+    const billingPeriod = item.billingPeriod.trim() || null;
 
     if (supabase && markingPaid) {
       const { data, error } = await supabase
@@ -1025,10 +1079,14 @@ export default function Home() {
         .insert({
           unit_id: item.id,
           base_rent: Number(item.baseRent),
+          rent_paid: rentPaidSnapshot,
           electricity_fee: electricityChargeSnapshot ?? 0,
           electricity_rate: rateSnapshot,
           electricity_charge: electricityChargeSnapshot,
           consumed_kwh: consumedKwh,
+          payment_date: paymentDate,
+          billing_period: billingPeriod,
+          amount_paid: amountPaid,
           total_due: amountPaid,
           status: "Paid",
           payment_method: item.paymentMethod || null,
@@ -1122,14 +1180,14 @@ export default function Home() {
 
       const extraction = payload as ReceiptExtraction;
       if (
-        typeof extraction.currentReading !== "number" ||
-        !Number.isFinite(extraction.currentReading)
+        typeof extraction.current_kwh !== "number" ||
+        !Number.isFinite(extraction.current_kwh)
       ) {
         throw new Error("The receipt did not include a kWh reading.");
       }
 
       const unitName =
-        typeof extraction.unitName === "string" ? extraction.unitName.trim() : "";
+        typeof extraction.unit === "string" ? extraction.unit.trim() : "";
       const matched = findUnitByReceiptName(unitsRef.current, unitName);
 
       if (!matched) {
@@ -1153,19 +1211,37 @@ export default function Home() {
             : "Could not store the receipt image.";
       }
 
-      const extractedAmountPaid =
-        typeof extraction.amountPaid === "number" &&
-        Number.isFinite(extraction.amountPaid)
-          ? extraction.amountPaid
-          : null;
-
       const unitPatch: Partial<DashboardUnit> = {
-        currentReading: String(extraction.currentReading),
+        currentReading: String(extraction.current_kwh),
         receiptUrl,
         message: null,
       };
-      if (extractedAmountPaid !== null) {
-        unitPatch.amountPaid = String(extractedAmountPaid);
+      if (typeof extraction.payment_date === "string" && extraction.payment_date) {
+        unitPatch.paymentDate = extraction.payment_date;
+      }
+      if (
+        typeof extraction.billing_period === "string" &&
+        extraction.billing_period.trim()
+      ) {
+        unitPatch.billingPeriod = extraction.billing_period.trim();
+      }
+      if (
+        typeof extraction.rent_paid === "number" &&
+        Number.isFinite(extraction.rent_paid)
+      ) {
+        unitPatch.rentPaid = String(extraction.rent_paid);
+      }
+      if (
+        typeof extraction.electricity_paid === "number" &&
+        Number.isFinite(extraction.electricity_paid)
+      ) {
+        unitPatch.electricityPaid = String(extraction.electricity_paid);
+      }
+      if (
+        typeof extraction.total_paid === "number" &&
+        Number.isFinite(extraction.total_paid)
+      ) {
+        unitPatch.amountPaid = String(extraction.total_paid);
       }
 
       patchUnit(matched.id, unitPatch);
@@ -1177,8 +1253,8 @@ export default function Home() {
       setReceiptNoticeIsError(uploadMessage !== null);
       setReceiptNotice(
         uploadMessage
-          ? `Set ${matched.label} current reading to ${extraction.currentReading.toLocaleString("en-PH")} kWh from “${unitName}”. The receipt image was not stored: ${uploadMessage}`
-          : `Set ${matched.label} current reading to ${extraction.currentReading.toLocaleString("en-PH")} kWh from “${unitName}”. Receipt image saved.`,
+          ? `Filled ${matched.label} from “${unitName}” (${extraction.current_kwh.toLocaleString("en-PH")} kWh). The receipt image was not stored: ${uploadMessage}`
+          : `Filled ${matched.label} from “${unitName}” (${extraction.current_kwh.toLocaleString("en-PH")} kWh). Receipt image saved.`,
       );
     } catch (error) {
       setReceiptNoticeIsError(true);
@@ -1584,6 +1660,105 @@ export default function Home() {
                           className={fieldClass}
                         />
                       </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Payment Date
+                        <input
+                          type="date"
+                          value={item.paymentDate}
+                          onChange={(event) =>
+                            patchUnit(item.id, {
+                              paymentDate: event.target.value,
+                              message: null,
+                            })
+                          }
+                          className={fieldClass}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Billing Period
+                        <input
+                          type="text"
+                          value={item.billingPeriod}
+                          onChange={(event) =>
+                            patchUnit(item.id, {
+                              billingPeriod: event.target.value,
+                              message: null,
+                            })
+                          }
+                          placeholder="October - November 2026"
+                          className={fieldClass}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Rent Paid
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          inputMode="decimal"
+                          value={item.rentPaid}
+                          onChange={(event) =>
+                            patchUnit(item.id, {
+                              rentPaid: event.target.value,
+                              message: null,
+                            })
+                          }
+                          placeholder="2500"
+                          className={fieldClass}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Electricity Paid
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          inputMode="decimal"
+                          value={item.electricityPaid}
+                          onChange={(event) =>
+                            patchUnit(item.id, {
+                              electricityPaid: event.target.value,
+                              message: null,
+                            })
+                          }
+                          placeholder="126"
+                          className={fieldClass}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                        Total Paid
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          inputMode="decimal"
+                          value={item.amountPaid}
+                          onChange={(event) =>
+                            patchUnit(item.id, {
+                              amountPaid: event.target.value,
+                              message: null,
+                            })
+                          }
+                          placeholder="2626"
+                          className={fieldClass}
+                        />
+                      </label>
+                      {item.receiptUrl ? (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setReceiptPreview(item.receiptUrl);
+                          }}
+                          className="overflow-hidden rounded-xl ring-1 ring-slate-200"
+                        >
+                          <img
+                            src={item.receiptUrl}
+                            alt={`Receipt for ${item.label}`}
+                            className="h-28 w-full object-cover"
+                          />
+                        </button>
+                      ) : null}
                       <dl className="grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
                         <div className="flex items-center justify-between gap-3">
                           <dt className="text-slate-500">Consumed kWh</dt>
@@ -1914,9 +2089,27 @@ export default function Home() {
                           </dd>
                         </div>
                         <div>
-                          <dt className="text-slate-500">Base rent</dt>
+                          <dt className="text-slate-500">Billing period</dt>
                           <dd className="font-medium">
-                            {formatMaybePeso(entry.baseRent ?? null, entry.wholeNumber)}
+                            {entry.billingPeriod ?? "—"}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Rent paid</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(
+                              entry.rentPaid ?? entry.baseRent,
+                              entry.wholeNumber,
+                            )}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Electricity paid</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(
+                              entry.electricityCharge,
+                              entry.wholeNumber,
+                            )}
                           </dd>
                         </div>
                         <div className="sm:col-span-2">
@@ -1933,7 +2126,10 @@ export default function Home() {
                         <div>
                           <dt className="text-slate-500">Total amount paid</dt>
                           <dd className="font-medium">
-                            {formatMaybePeso(entry.totalPaid, entry.wholeNumber)}
+                            {formatMaybePeso(
+                              entry.amountPaid ?? entry.totalPaid,
+                              entry.wholeNumber,
+                            )}
                           </dd>
                         </div>
                         <div>
@@ -2010,10 +2206,27 @@ export default function Home() {
               )}
               <dl className="grid flex-1 grid-cols-1 gap-3 text-sm">
                 <div>
-                  <dt className="text-slate-500">Base rent</dt>
+                  <dt className="text-slate-500">Billing period</dt>
+                  <dd className="font-medium">
+                    {selectedLedgerEntry.billingPeriod ?? "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Rent paid</dt>
                   <dd className="font-medium">
                     {formatMaybePeso(
-                      selectedLedgerEntry.baseRent ?? null,
+                      selectedLedgerEntry.rentPaid ??
+                        selectedLedgerEntry.baseRent ??
+                        null,
+                      selectedLedgerEntry.wholeNumber,
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Electricity paid</dt>
+                  <dd className="font-medium">
+                    {formatMaybePeso(
+                      selectedLedgerEntry.electricityCharge,
                       selectedLedgerEntry.wholeNumber,
                     )}
                   </dd>
@@ -2033,7 +2246,8 @@ export default function Home() {
                   <dt className="text-slate-500">Total amount paid</dt>
                   <dd className="text-base font-semibold">
                     {formatMaybePeso(
-                      selectedLedgerEntry.totalPaid,
+                      selectedLedgerEntry.amountPaid ??
+                        selectedLedgerEntry.totalPaid,
                       selectedLedgerEntry.wholeNumber,
                     )}
                   </dd>
@@ -2125,7 +2339,7 @@ export default function Home() {
                           No receipt
                         </div>
                       )}
-                      <dl className="grid flex-1 grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-5">
+                      <dl className="grid flex-1 grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">
                         <div>
                           <dt className="text-slate-500">Unit name</dt>
                           <dd className="font-semibold text-slate-900">
@@ -2141,12 +2355,24 @@ export default function Home() {
                           </dd>
                         </div>
                         <div>
-                          <dt className="text-slate-500">Base rent</dt>
+                          <dt className="text-slate-500">Billing period</dt>
                           <dd className="font-medium">
-                            {formatMaybePeso(record.baseRent)}
+                            {record.billingPeriod ?? "—"}
                           </dd>
                         </div>
-                        <div className="sm:col-span-2 lg:col-span-2">
+                        <div>
+                          <dt className="text-slate-500">Rent paid</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(record.rentPaid ?? record.baseRent)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-slate-500">Electricity paid</dt>
+                          <dd className="font-medium">
+                            {formatMaybePeso(record.electricityCharge)}
+                          </dd>
+                        </div>
+                        <div className="sm:col-span-2 lg:col-span-3">
                           <dt className="text-slate-500">Consumed kWh</dt>
                           <dd className="font-medium">
                             {formatConsumedKwhLine(
@@ -2160,7 +2386,9 @@ export default function Home() {
                         <div>
                           <dt className="text-slate-500">Total amount paid</dt>
                           <dd className="font-semibold text-slate-900">
-                            {formatMaybePeso(record.totalPaid)}
+                            {formatMaybePeso(
+                              record.amountPaid ?? record.totalPaid,
+                            )}
                           </dd>
                         </div>
                         <div>

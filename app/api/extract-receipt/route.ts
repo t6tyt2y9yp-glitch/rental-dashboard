@@ -2,17 +2,29 @@ import { GoogleGenAI } from "@google/genai";
 
 const MODEL = "gemini-4-hydrogen";
 
-const SYSTEM_INSTRUCTION = `Analyze this handwritten rent receipt or notebook ledger.
-Extract both of these values:
-1. unitName: the tenant or unit identifier, usually written next to "RECEIVED from". Copy it as written. Examples: "9N", "Unit 1", "Unit 9".
-2. currentReading: the current kWh reading. Examples: "666 Kwh", "666 kWh". Return only the number, without the unit.
-Return ONLY a raw JSON object with exactly two keys: "unitName" (string) and "currentReading" (number).
-Do not use markdown, code fences, or any other keys.
-If the unit identifier is missing, use an empty string. If the kWh reading is missing, use null.`;
+const SYSTEM_INSTRUCTION = `Analyze this handwritten rental receipt or notebook ledger page.
+Extract ALL of these fields:
+1. unit: the tenant or unit identifier next to "RECEIVED from" (e.g. "9n", "9N", "Unit 1"). Copy as written.
+2. current_kwh: the current kWh meter reading number only (e.g. 666 from "666 Kwh").
+3. payment_date: the receipt date as ISO YYYY-MM-DD (e.g. "2026-11-18" from "Date: November 18, 2026").
+4. rent_paid: the rent peso amount as a number (e.g. 2500 from "₱2,500 + ₱126").
+5. electricity_paid: the electricity peso amount as a number (e.g. 126).
+6. billing_period: the period text from "As payment for" (e.g. "October - November 2026").
+7. total_paid: the total peso amount paid as a number (e.g. 2626).
+
+Return ONLY a raw JSON object with exactly these keys:
+unit (string), current_kwh (number|null), payment_date (string|null), rent_paid (number|null), electricity_paid (number|null), billing_period (string|null), total_paid (number|null).
+Do not use markdown or code fences.
+If a field is missing, use an empty string for unit/billing_period/payment_date strings, or null for numbers.`;
 
 type ReceiptExtraction = {
-  unitName: string;
-  currentReading: number;
+  unit: string;
+  current_kwh: number | null;
+  payment_date: string | null;
+  rent_paid: number | null;
+  electricity_paid: number | null;
+  billing_period: string | null;
+  total_paid: number | null;
 };
 
 const ALLOWED_MIME_TYPES = new Set([
@@ -90,6 +102,32 @@ function toNullableNumber(value: unknown): number | null {
   return null;
 }
 
+function toNullableString(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function toIsoDate(value: unknown): string | null {
+  const text = toNullableString(value);
+  if (!text) {
+    return null;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    return text;
+  }
+
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return new Date(parsed).toISOString().slice(0, 10);
+}
+
 function parseReceipt(text: string): ReceiptExtraction {
   const trimmed = text.trim();
   const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
@@ -101,19 +139,33 @@ function parseReceipt(text: string): ReceiptExtraction {
   }
 
   const record = parsed as Record<string, unknown>;
-  const unitName =
-    typeof record.unitName === "string"
-      ? record.unitName.trim()
-      : record.unitName == null
-        ? ""
-        : String(record.unitName).trim();
-  const currentReading = toNullableNumber(record.currentReading);
+  const unit =
+    toNullableString(record.unit) ??
+    toNullableString(record.unitName) ??
+    "";
+  const current_kwh =
+    toNullableNumber(record.current_kwh) ??
+    toNullableNumber(record.currentReading);
+  const payment_date = toIsoDate(record.payment_date);
+  const rent_paid = toNullableNumber(record.rent_paid);
+  const electricity_paid = toNullableNumber(record.electricity_paid);
+  const billing_period = toNullableString(record.billing_period);
+  const total_paid =
+    toNullableNumber(record.total_paid) ?? toNullableNumber(record.amountPaid);
 
-  if (currentReading === null) {
+  if (current_kwh === null) {
     throw new Error("The receipt did not include a kWh reading.");
   }
 
-  return { unitName, currentReading };
+  return {
+    unit,
+    current_kwh,
+    payment_date,
+    rent_paid,
+    electricity_paid,
+    billing_period,
+    total_paid,
+  };
 }
 
 function publicErrorMessage(error: unknown, apiKey: string) {
@@ -161,10 +213,33 @@ export async function POST(request: Request) {
         responseJsonSchema: {
           type: "object",
           additionalProperties: false,
-          required: ["unitName", "currentReading"],
+          required: [
+            "unit",
+            "current_kwh",
+            "payment_date",
+            "rent_paid",
+            "electricity_paid",
+            "billing_period",
+            "total_paid",
+          ],
           properties: {
-            unitName: { type: "string" },
-            currentReading: {
+            unit: { type: "string" },
+            current_kwh: {
+              anyOf: [{ type: "number" }, { type: "null" }],
+            },
+            payment_date: {
+              anyOf: [{ type: "string" }, { type: "null" }],
+            },
+            rent_paid: {
+              anyOf: [{ type: "number" }, { type: "null" }],
+            },
+            electricity_paid: {
+              anyOf: [{ type: "number" }, { type: "null" }],
+            },
+            billing_period: {
+              anyOf: [{ type: "string" }, { type: "null" }],
+            },
+            total_paid: {
               anyOf: [{ type: "number" }, { type: "null" }],
             },
           },
