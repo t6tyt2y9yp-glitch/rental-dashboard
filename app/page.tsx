@@ -25,6 +25,7 @@ type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 type ReceiptExtraction = {
   unitName: string;
   currentReading: number;
+  amountPaid?: number | null;
 };
 
 type DashboardUnit = {
@@ -37,6 +38,7 @@ type DashboardUnit = {
   paymentId: string | null;
   previousReading: string;
   currentReading: string;
+  amountPaid: string;
   balance: number;
   receiptUrl: string | null;
   message: string | null;
@@ -211,6 +213,7 @@ function mapUnits(unitRows: UnitRow[], paymentRows: PaymentRow[]): DashboardUnit
             : String(payment.id),
         previousReading: "",
         currentReading: "",
+        amountPaid: "",
         balance: asBalance(row.balance),
         receiptUrl:
           typeof payment?.receipt_url === "string" ? payment.receipt_url : null,
@@ -441,16 +444,22 @@ function receivedByFromUser(user: User | null) {
   return mapped ?? email;
 }
 
+function normalizeUnitName(value: string) {
+  return value
+    .trim()
+    .toUpperCase()
+    .replace(/UNIT/g, "")
+    .replace(/\s+/g, "");
+}
+
 function findUnitByReceiptName(units: DashboardUnit[], unitName: string) {
-  const exact = unitName.trim().toLowerCase().replace(/\s+/g, " ");
-  if (!exact) {
+  const needle = normalizeUnitName(unitName);
+  if (!needle) {
     return null;
   }
 
   return (
-    units.find(
-      (unit) => unit.label.trim().toLowerCase().replace(/\s+/g, " ") === exact,
-    ) ?? null
+    units.find((unit) => normalizeUnitName(unit.label) === needle) ?? null
   );
 }
 
@@ -1127,7 +1136,7 @@ export default function Home() {
         setReceiptNoticeIsError(true);
         setReceiptNotice(
           unitName
-            ? `No unit matches “${unitName}”.`
+            ? `No unit matches “${unitName}”. Gemini returned that exact unit name.`
             : "The receipt did not include a unit name.",
         );
         return;
@@ -1144,12 +1153,27 @@ export default function Home() {
             : "Could not store the receipt image.";
       }
 
-      patchUnit(matched.id, {
+      const extractedAmountPaid =
+        typeof extraction.amountPaid === "number" &&
+        Number.isFinite(extraction.amountPaid)
+          ? extraction.amountPaid
+          : null;
+
+      const unitPatch: Partial<DashboardUnit> = {
         currentReading: String(extraction.currentReading),
         receiptUrl,
         message: null,
-      });
+      };
+      if (extractedAmountPaid !== null) {
+        unitPatch.amountPaid = String(extractedAmountPaid);
+      }
+
+      patchUnit(matched.id, unitPatch);
       setActiveTier(matched.baseRent);
+      setOpenUnitIds((current) => ({
+        ...current,
+        [matched.id]: true,
+      }));
       setReceiptNoticeIsError(uploadMessage !== null);
       setReceiptNotice(
         uploadMessage
