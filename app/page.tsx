@@ -395,6 +395,39 @@ function formatExpenseDate(value: string) {
   });
 }
 
+function paymentMonthKey(value: string) {
+  if (!value) {
+    return null;
+  }
+
+  const sliced = value.slice(0, 7);
+  if (/^\d{4}-\d{2}$/.test(sliced)) {
+    return sliced;
+  }
+
+  const date = new Date(value.includes("T") ? value : `${value.slice(0, 10)}T00:00:00`);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${date.getFullYear()}-${month}`;
+}
+
+function formatMonthOption(monthKey: string) {
+  const [yearText, monthText] = monthKey.split("-");
+  const year = Number(yearText);
+  const month = Number(monthText);
+  if (!Number.isFinite(year) || !Number.isFinite(month)) {
+    return monthKey;
+  }
+
+  return new Date(year, month - 1, 1).toLocaleDateString("en-PH", {
+    year: "numeric",
+    month: "long",
+  });
+}
+
 function isAdminEmail(email: string | null | undefined) {
   return (email ?? "").trim().toLowerCase() === ADMIN_EMAIL;
 }
@@ -510,6 +543,8 @@ export default function Home() {
   const [amount, setAmount] = useState("");
   const [savingExpense, setSavingExpense] = useState(false);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
+  const [ledgerSearch, setLedgerSearch] = useState("");
+  const [ledgerMonth, setLedgerMonth] = useState("");
   const [electricityRateInput, setElectricityRateInput] = useState("");
   const [scanningReceipt, setScanningReceipt] = useState(false);
   const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
@@ -670,6 +705,37 @@ export default function Home() {
     () => units.filter((item) => item.baseRent === activeTier),
     [units, activeTier],
   );
+
+  const ledgerMonthOptions = useMemo(() => {
+    const months = new Set<string>();
+    for (const entry of ledger) {
+      const key = paymentMonthKey(entry.datePaid);
+      if (key) {
+        months.add(key);
+      }
+    }
+    return [...months].sort((a, b) => b.localeCompare(a));
+  }, [ledger]);
+
+  const ledgerFilterActive =
+    ledgerSearch.trim() !== "" || ledgerMonth !== "";
+
+  const filteredLedger = useMemo(() => {
+    if (!ledgerFilterActive) {
+      return [];
+    }
+
+    const query = ledgerSearch.trim().toLowerCase();
+    return ledger.filter((entry) => {
+      const matchesSearch =
+        query === "" ||
+        entry.unitName.toLowerCase().includes(query) ||
+        entry.receivedBy.toLowerCase().includes(query);
+      const matchesMonth =
+        ledgerMonth === "" || paymentMonthKey(entry.datePaid) === ledgerMonth;
+      return matchesSearch && matchesMonth;
+    });
+  }, [ledger, ledgerFilterActive, ledgerMonth, ledgerSearch]);
 
   async function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1743,18 +1809,65 @@ export default function Home() {
               Payment Ledger
             </h2>
             <p className="mt-1 text-sm text-slate-500">
-              Marking a unit Paid records it here. Starting a new month keeps
-              this history.
+              Look up payment history by unit name, who received it, or month.
             </p>
           </div>
-          {ledger.length === 0 ? (
+
+          <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end">
+            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+              Search
+              <input
+                type="search"
+                value={ledgerSearch}
+                onChange={(event) => setLedgerSearch(event.target.value)}
+                placeholder="Unit name or received by"
+                className={fieldClass}
+              />
+            </label>
+            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+              Month
+              <select
+                value={ledgerMonth}
+                onChange={(event) => setLedgerMonth(event.target.value)}
+                className={fieldClass}
+              >
+                <option value="">Select month</option>
+                {ledgerMonthOptions.map((monthKey) => (
+                  <option key={monthKey} value={monthKey}>
+                    {formatMonthOption(monthKey)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {ledgerFilterActive ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setLedgerSearch("");
+                  setLedgerMonth("");
+                  setSelectedLedgerEntry(null);
+                }}
+                className={primaryButtonClass}
+              >
+                Clear
+              </button>
+            ) : (
+              <div className="hidden sm:block" aria-hidden="true" />
+            )}
+          </div>
+
+          {!ledgerFilterActive ? (
             <p className="mt-5 rounded-xl bg-slate-50 px-4 py-6 text-sm text-slate-500">
-              No payments recorded yet.
+              Search a unit (e.g., 1N) or select a month to view payment history.
+            </p>
+          ) : filteredLedger.length === 0 ? (
+            <p className="mt-5 rounded-xl bg-slate-50 px-4 py-6 text-sm text-slate-500">
+              No matching payments.
             </p>
           ) : (
             <div className="mt-5 max-h-80 overflow-y-auto rounded-xl border border-slate-100">
               <ul className="divide-y divide-slate-100">
-                {ledger.map((entry) => (
+                {filteredLedger.map((entry) => (
                   <li key={entry.id}>
                     <button
                       type="button"
