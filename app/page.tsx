@@ -51,6 +51,8 @@ type LedgerEntry = {
   totalPaid: number;
   baseRent: number;
   consumedKwh: number | null;
+  electricityRate: number | null;
+  electricityCharge: number | null;
   wholeNumber: boolean;
   datePaid: string;
   paymentMethod: string;
@@ -64,6 +66,8 @@ type PaymentHistoryRecord = {
   paymentDate: string | null;
   baseRent: number | null;
   consumedKwh: number | null;
+  electricityRate: number | null;
+  electricityCharge: number | null;
   totalPaid: number | null;
   receiptUrl: string | null;
   receivedBy: string | null;
@@ -259,6 +263,36 @@ function historyNumber(value: unknown) {
   return null;
 }
 
+function formatRatePeso(rate: number) {
+  return `₱${rate.toLocaleString("en-PH", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function formatConsumedKwhLine(
+  consumedKwh: number | null,
+  electricityRate: number | null,
+  electricityCharge: number | null,
+  wholeNumber = false,
+) {
+  if (consumedKwh == null) {
+    return "—";
+  }
+
+  const kwhLabel = `${consumedKwh.toLocaleString("en-PH")} kWh`;
+  if (electricityRate == null) {
+    return kwhLabel;
+  }
+
+  const chargeLabel =
+    electricityCharge == null
+      ? "—"
+      : formatMaybePeso(electricityCharge, wholeNumber);
+
+  return `${kwhLabel} × ${formatRatePeso(electricityRate)}/kWh = ${chargeLabel}`;
+}
+
 function mapPaymentHistory(
   rows: PaymentRow[],
   unitLabels: Map<string, string>,
@@ -289,6 +323,10 @@ function mapPaymentHistory(
           paymentDate,
           baseRent: historyNumber(row.base_rent ?? row.baseRent),
           consumedKwh: historyNumber(row.consumed_kwh),
+          electricityRate: historyNumber(row.electricity_rate),
+          electricityCharge: historyNumber(
+            row.electricity_charge ?? row.electricity_fee,
+          ),
           totalPaid: historyNumber(row.total_due ?? row.totalPaid),
           receiptUrl: typeof row.receipt_url === "string" ? row.receipt_url : null,
           receivedBy:
@@ -325,6 +363,8 @@ function paymentsToLedger(
         totalPaid: record.totalPaid,
         baseRent: record.baseRent,
         consumedKwh: record.consumedKwh,
+        electricityRate: record.electricityRate,
+        electricityCharge: record.electricityCharge,
         wholeNumber: record.baseRent === 5000,
         datePaid: record.paymentDate ?? new Date().toISOString(),
         paymentMethod:
@@ -887,6 +927,16 @@ export default function Home() {
 
     const receivedBy = markingPaid ? receivedByFromUser(user) : null;
     const consumedKwh = bill?.consumed == null ? null : Number(bill.consumed);
+    const rateSnapshot =
+      electricityRate !== null && Number.isFinite(Number(electricityRate))
+        ? Number(electricityRate)
+        : null;
+    const electricityChargeSnapshot =
+      consumedKwh != null && rateSnapshot != null
+        ? Number((consumedKwh * rateSnapshot).toFixed(bill?.roundsToWholePeso ? 0 : 2))
+        : bill?.electricityCharge == null
+          ? null
+          : Number(bill.electricityCharge);
     const totalDue =
       bill?.totalAmountDue == null
         ? item.baseRent + item.balance
@@ -900,8 +950,9 @@ export default function Home() {
         .insert({
           unit_id: item.id,
           base_rent: Number(item.baseRent),
-          electricity_fee:
-            bill?.electricityCharge == null ? 0 : Number(bill.electricityCharge),
+          electricity_fee: electricityChargeSnapshot ?? 0,
+          electricity_rate: rateSnapshot,
+          electricity_charge: electricityChargeSnapshot,
           consumed_kwh: consumedKwh,
           total_due: amountPaid,
           status: "Paid",
@@ -1731,12 +1782,15 @@ export default function Home() {
                             {formatMaybePeso(entry.baseRent ?? null, entry.wholeNumber)}
                           </dd>
                         </div>
-                        <div>
+                        <div className="sm:col-span-2">
                           <dt className="text-slate-500">Consumed kWh</dt>
                           <dd className="font-medium">
-                            {entry.consumedKwh == null
-                              ? "—"
-                              : `${entry.consumedKwh.toLocaleString("en-PH")} kWh`}
+                            {formatConsumedKwhLine(
+                              entry.consumedKwh,
+                              entry.electricityRate,
+                              entry.electricityCharge,
+                              entry.wholeNumber,
+                            )}
                           </dd>
                         </div>
                         <div>
@@ -1830,9 +1884,12 @@ export default function Home() {
                 <div>
                   <dt className="text-slate-500">Consumed kWh</dt>
                   <dd className="font-medium">
-                    {selectedLedgerEntry.consumedKwh == null
-                      ? "—"
-                      : `${selectedLedgerEntry.consumedKwh.toLocaleString("en-PH")} kWh`}
+                    {formatConsumedKwhLine(
+                      selectedLedgerEntry.consumedKwh,
+                      selectedLedgerEntry.electricityRate,
+                      selectedLedgerEntry.electricityCharge,
+                      selectedLedgerEntry.wholeNumber,
+                    )}
                   </dd>
                 </div>
                 <div>
@@ -1952,12 +2009,15 @@ export default function Home() {
                             {formatMaybePeso(record.baseRent)}
                           </dd>
                         </div>
-                        <div>
+                        <div className="sm:col-span-2 lg:col-span-2">
                           <dt className="text-slate-500">Consumed kWh</dt>
                           <dd className="font-medium">
-                            {record.consumedKwh === null
-                              ? "—"
-                              : `${record.consumedKwh.toLocaleString("en-PH")} kWh`}
+                            {formatConsumedKwhLine(
+                              record.consumedKwh,
+                              record.electricityRate,
+                              record.electricityCharge,
+                              record.baseRent === 5000,
+                            )}
                           </dd>
                         </div>
                         <div>
