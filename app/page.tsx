@@ -7,8 +7,14 @@ import {
   type SupabaseClient,
   type User,
 } from "@supabase/supabase-js";
+import {
+  AnimatePresence,
+  motion,
+  useReducedMotion,
+} from "framer-motion";
 
 const RENT_TIERS = [2500, 3000, 5000] as const;
+const APPLE_EASE = [0.22, 1, 0.36, 1] as const;
 const UNIT_STATUSES = ["Occupied", "Vacant", "Maintenance"] as const;
 const PAYMENT_STATUSES = ["Paid", "Partial", "Unpaid"] as const;
 const PAYMENT_METHODS = ["Cash", "GCash"] as const;
@@ -30,6 +36,22 @@ type ReceiptExtraction = {
   electricity_paid: number | null;
   billing_period: string | null;
   total_paid: number | null;
+};
+
+type BatchMatchedUnit = {
+  unitId: string;
+  label: string;
+  baseRent: RentTier;
+};
+
+type BatchFailedItem = {
+  fileName: string;
+  reason: string;
+};
+
+type BatchProgress = {
+  current: number;
+  total: number;
 };
 
 type DashboardUnit = {
@@ -102,6 +124,190 @@ function asBalance(value: unknown) {
   }
   const amount = typeof value === "number" ? value : Number(value);
   return Number.isFinite(amount) ? amount : 0;
+}
+
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 767px)");
+    const sync = () => setIsMobile(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
+
+  return isMobile;
+}
+
+type AudioContextRef = { current: AudioContext | null };
+
+function getAudioContextConstructor(): (typeof AudioContext) | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const withWebkit = window as Window & {
+    webkitAudioContext?: typeof AudioContext;
+  };
+  return window.AudioContext ?? withWebkit.webkitAudioContext ?? null;
+}
+
+function unlockAudio(audioCtxRef: AudioContextRef) {
+  try {
+    const AudioCtx = getAudioContextConstructor();
+    if (!AudioCtx) {
+      return;
+    }
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioCtx();
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx.state === "suspended") {
+      void ctx.resume();
+    }
+  } catch {
+    // Silent fallback for unsupported / restricted browsers.
+  }
+}
+
+function scheduleBellPartial(
+  ctx: AudioContext,
+  destination: AudioNode,
+  frequency: number,
+  startAt: number,
+  peakGain: number,
+  duration: number,
+) {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(frequency, startAt);
+  gain.gain.setValueAtTime(0.0001, startAt);
+  gain.gain.exponentialRampToValueAtTime(peakGain, startAt + 0.005);
+  gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
+  osc.connect(gain);
+  gain.connect(destination);
+  osc.start(startAt);
+  osc.stop(startAt + duration + 0.05);
+}
+
+function playApplePayChime(audioCtxRef: AudioContextRef) {
+  try {
+    unlockAudio(audioCtxRef);
+    const ctx = audioCtxRef.current;
+    if (!ctx) {
+      return;
+    }
+    if (ctx.state === "suspended") {
+      void ctx.resume();
+    }
+
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0.18, ctx.currentTime);
+    master.connect(ctx.destination);
+
+    const t0 = ctx.currentTime;
+    // Note 1: B5 + 2nd harmonic
+    scheduleBellPartial(ctx, master, 987.77, t0, 1, 0.28);
+    scheduleBellPartial(ctx, master, 1975.53, t0, 0.2, 0.28);
+    // Note 2: E6 + 2nd harmonic
+    scheduleBellPartial(ctx, master, 1318.51, t0 + 0.11, 1, 0.55);
+    scheduleBellPartial(ctx, master, 2637.02, t0 + 0.11, 0.2, 0.55);
+  } catch {
+    // Silent fallback if audio is blocked or unavailable.
+  }
+}
+
+function PaymentStatusBadge({
+  status,
+  isMobile,
+  className,
+}: {
+  status: PaymentStatus;
+  isMobile: boolean;
+  className: string;
+}) {
+  if (!isMobile) {
+    return <span className={className}>{status}</span>;
+  }
+
+  return (
+    <motion.span
+      key={status}
+      initial={{ scale: 0.85 }}
+      animate={{ scale: 1 }}
+      transition={{ type: "spring", stiffness: 420, damping: 18 }}
+      className={className}
+    >
+      {status}
+    </motion.span>
+  );
+}
+
+function MobileSuccessOverlay({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss: () => void;
+}) {
+  useEffect(() => {
+    const timer = window.setTimeout(onDismiss, 2200);
+    return () => window.clearTimeout(timer);
+  }, [message, onDismiss]);
+
+  return (
+    <motion.div
+      className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/35 p-6 md:hidden"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.18, ease: APPLE_EASE }}
+      onClick={onDismiss}
+    >
+      <motion.div
+        role="status"
+        aria-live="polite"
+        initial={{ opacity: 0, scale: 0.86, y: 12 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.94, y: 8 }}
+        transition={{ type: "spring", stiffness: 320, damping: 19 }}
+        className="w-full max-w-sm rounded-3xl border border-white/40 bg-white/80 px-6 py-8 text-center shadow-2xl backdrop-blur-xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="mx-auto flex h-20 w-20 items-center justify-center">
+          <svg viewBox="0 0 72 72" className="h-20 w-20" aria-hidden="true">
+            <motion.circle
+              cx="36"
+              cy="36"
+              r="30"
+              fill="none"
+              stroke="#16a34a"
+              strokeWidth="4"
+              initial={{ pathLength: 0, opacity: 0.35 }}
+              animate={{ pathLength: 1, opacity: 1 }}
+              transition={{ duration: 0.45, ease: APPLE_EASE }}
+            />
+            <motion.path
+              d="M22 37.5 L31.5 47 L51 27"
+              fill="none"
+              stroke="#16a34a"
+              strokeWidth="4.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              initial={{ pathLength: 0 }}
+              animate={{ pathLength: 1 }}
+              transition={{ duration: 0.35, delay: 0.22, ease: APPLE_EASE }}
+            />
+          </svg>
+        </div>
+        <p className="mt-4 text-lg font-semibold tracking-tight text-slate-900">
+          {message}
+        </p>
+        <p className="mt-1 text-sm text-slate-500">Tap anywhere to dismiss</p>
+      </motion.div>
+    </motion.div>
+  );
 }
 
 type Expense = {
@@ -494,6 +700,45 @@ function findUnitByReceiptName(units: DashboardUnit[], unitName: string) {
   );
 }
 
+function unitPatchFromExtraction(
+  extraction: ReceiptExtraction,
+  receiptUrl: string | null,
+): Partial<DashboardUnit> {
+  const unitPatch: Partial<DashboardUnit> = {
+    currentReading: String(extraction.current_kwh),
+    receiptUrl,
+    message: null,
+  };
+  if (typeof extraction.payment_date === "string" && extraction.payment_date) {
+    unitPatch.paymentDate = extraction.payment_date;
+  }
+  if (
+    typeof extraction.billing_period === "string" &&
+    extraction.billing_period.trim()
+  ) {
+    unitPatch.billingPeriod = extraction.billing_period.trim();
+  }
+  if (
+    typeof extraction.rent_paid === "number" &&
+    Number.isFinite(extraction.rent_paid)
+  ) {
+    unitPatch.rentPaid = String(extraction.rent_paid);
+  }
+  if (
+    typeof extraction.electricity_paid === "number" &&
+    Number.isFinite(extraction.electricity_paid)
+  ) {
+    unitPatch.electricityPaid = String(extraction.electricity_paid);
+  }
+  if (
+    typeof extraction.total_paid === "number" &&
+    Number.isFinite(extraction.total_paid)
+  ) {
+    unitPatch.amountPaid = String(extraction.total_paid);
+  }
+  return unitPatch;
+}
+
 function compressReceiptImage(file: File) {
   return new Promise<string>((resolve, reject) => {
     const objectUrl = URL.createObjectURL(file);
@@ -561,6 +806,10 @@ async function uploadReceiptImage(unitId: string, dataUrl: string) {
 }
 
 export default function Home() {
+  const isMobile = useIsMobile();
+  const reduceMotion = useReducedMotion();
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const [mobileSuccess, setMobileSuccess] = useState<string | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [loginEmail, setLoginEmail] = useState("");
@@ -587,10 +836,16 @@ export default function Home() {
   const [ledgerMonth, setLedgerMonth] = useState("");
   const [electricityRateInput, setElectricityRateInput] = useState("");
   const [scanningReceipt, setScanningReceipt] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
+  const [batchMatched, setBatchMatched] = useState<BatchMatchedUnit[]>([]);
+  const [batchFailed, setBatchFailed] = useState<BatchFailedItem[]>([]);
   const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
   const [receiptNoticeIsError, setReceiptNoticeIsError] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [openUnitIds, setOpenUnitIds] = useState<Record<string, boolean>>({});
+  const [selectedDesktopUnitId, setSelectedDesktopUnitId] = useState<
+    string | null
+  >(null);
   const [selectedUnitName, setSelectedUnitName] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -745,6 +1000,33 @@ export default function Home() {
     () => units.filter((item) => item.baseRent === activeTier),
     [units, activeTier],
   );
+
+  useEffect(() => {
+    if (visibleUnits.length === 0) {
+      setSelectedDesktopUnitId(null);
+      return;
+    }
+
+    setSelectedDesktopUnitId((current) =>
+      current && visibleUnits.some((unit) => unit.id === current)
+        ? current
+        : visibleUnits[0].id,
+    );
+  }, [visibleUnits]);
+
+  const selectedDesktopUnit =
+    visibleUnits.find((unit) => unit.id === selectedDesktopUnitId) ?? null;
+
+  function announceSuccess(message: string) {
+    if (isMobile && !reduceMotion) {
+      setMobileSuccess(message);
+      setReceiptNotice(null);
+      setReceiptNoticeIsError(false);
+      return;
+    }
+    setReceiptNoticeIsError(false);
+    setReceiptNotice(message);
+  }
 
   const ledgerMonthOptions = useMemo(() => {
     const months = new Set<string>();
@@ -1023,9 +1305,14 @@ export default function Home() {
       return;
     }
 
+    const markingPaid = next === "Paid";
+    // Unlock audio during the user gesture so iOS/Android allow the success chime.
+    if (markingPaid && isMobile) {
+      unlockAudio(audioCtxRef);
+    }
+
     patchUnit(item.id, { paymentStatus: next, message: null });
 
-    const markingPaid = next === "Paid";
     const bill = markingPaid
       ? meterBill(
           item.previousReading,
@@ -1136,6 +1423,16 @@ export default function Home() {
           ]);
         }
       }
+
+      if (isMobile) {
+        playApplePayChime(audioCtxRef);
+        try {
+          navigator.vibrate?.([30, 50, 40]);
+        } catch {
+          // Haptics are best-effort only.
+        }
+      }
+      announceSuccess(`${item.label} Marked as Paid`);
       return;
     }
 
@@ -1154,115 +1451,562 @@ export default function Home() {
     }
   }
 
-  async function scanGlobalReceipt(file: File) {
+  function focusMatchedUnit(unit: BatchMatchedUnit) {
+    setActiveTier(unit.baseRent);
+    setSelectedDesktopUnitId(unit.unitId);
+    setOpenUnitIds((current) => ({
+      ...current,
+      [unit.unitId]: true,
+    }));
+  }
+
+  function renderUnitEditor(
+    item: DashboardUnit,
+    options?: { split?: boolean },
+  ) {
+    const split = options?.split === true;
+    const bill = meterBill(
+      item.previousReading,
+      item.currentReading,
+      electricityRate,
+      item.baseRent,
+      item.balance,
+    );
+    const totalDueDisplay =
+      bill.totalAmountDue == null
+        ? item.baseRent + item.balance
+        : bill.totalAmountDue;
+
+    return (
+      <div
+        className={
+          split
+            ? "grid grid-cols-1 gap-4 sm:grid-cols-2"
+            : "flex flex-col gap-4"
+        }
+      >
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Previous kWh
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            inputMode="decimal"
+            value={item.previousReading}
+            readOnly={!isAdmin}
+            disabled={!isAdmin}
+            onChange={(event) => {
+              if (!isAdmin) {
+                return;
+              }
+              patchUnit(item.id, {
+                previousReading: event.target.value,
+                message: null,
+              });
+            }}
+            placeholder="Previous kWh"
+            className={`${fieldClass}${
+              isAdmin ? "" : " cursor-not-allowed bg-slate-50 text-slate-600"
+            }`}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Current kWh
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            inputMode="decimal"
+            value={item.currentReading}
+            onChange={(event) =>
+              patchUnit(item.id, {
+                currentReading: event.target.value,
+                message: null,
+              })
+            }
+            placeholder="Current kWh"
+            className={fieldClass}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Payment Date
+          <input
+            type="date"
+            value={item.paymentDate}
+            onChange={(event) =>
+              patchUnit(item.id, {
+                paymentDate: event.target.value,
+                message: null,
+              })
+            }
+            className={fieldClass}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Billing Period
+          <input
+            type="text"
+            value={item.billingPeriod}
+            onChange={(event) =>
+              patchUnit(item.id, {
+                billingPeriod: event.target.value,
+                message: null,
+              })
+            }
+            placeholder="October - November 2026"
+            className={fieldClass}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Rent Paid
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            inputMode="decimal"
+            value={item.rentPaid}
+            onChange={(event) =>
+              patchUnit(item.id, {
+                rentPaid: event.target.value,
+                message: null,
+              })
+            }
+            placeholder="2500"
+            className={fieldClass}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Electricity Paid
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            inputMode="decimal"
+            value={item.electricityPaid}
+            onChange={(event) =>
+              patchUnit(item.id, {
+                electricityPaid: event.target.value,
+                message: null,
+              })
+            }
+            placeholder="126"
+            className={fieldClass}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Total Paid
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            inputMode="decimal"
+            value={item.amountPaid}
+            onChange={(event) =>
+              patchUnit(item.id, {
+                amountPaid: event.target.value,
+                message: null,
+              })
+            }
+            placeholder="2626"
+            className={fieldClass}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Payment method
+          <select
+            value={item.paymentMethod}
+            onChange={(event) =>
+              void changeMethod(item, event.target.value as PaymentMethod)
+            }
+            className={fieldClass}
+          >
+            <option value="" disabled>
+              Choose method
+            </option>
+            {PAYMENT_METHODS.map((method) => (
+              <option key={method} value={method}>
+                {method}
+              </option>
+            ))}
+          </select>
+        </label>
+        {item.receiptUrl ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setReceiptPreview(item.receiptUrl);
+            }}
+            className={`overflow-hidden rounded-xl ring-1 ring-slate-200 ${
+              split ? "sm:col-span-2" : ""
+            }`}
+          >
+            <img
+              src={item.receiptUrl}
+              alt={`Receipt for ${item.label}`}
+              className="h-28 w-full object-cover"
+            />
+          </button>
+        ) : null}
+        <dl
+          className={`grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm ${
+            split ? "sm:col-span-2 sm:grid-cols-2" : ""
+          }`}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <dt className="text-slate-500">Consumed kWh</dt>
+            <dd className="font-semibold text-slate-900">
+              {bill.consumed === null
+                ? "—"
+                : `${bill.roundsToWholePeso ? bill.consumed.toFixed(0) : bill.consumed.toLocaleString("en-PH")} kWh`}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <dt className="text-slate-500">Electricity Charge</dt>
+            <dd className="font-medium">
+              {formatMaybePeso(bill.electricityCharge, bill.roundsToWholePeso)}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <dt className="text-slate-500">Remaining Balance</dt>
+            <dd className="flex items-center gap-2">
+              <span
+                className={`font-semibold ${
+                  item.balance > 0 ? "text-amber-700" : "text-slate-400"
+                }`}
+              >
+                {peso(item.balance)}
+              </span>
+              {isAdmin && item.balance > 0 ? (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void clearBalance(item);
+                  }}
+                  className="rounded-md px-2 py-1 text-xs font-medium text-rose-700 ring-1 ring-rose-200 hover:bg-rose-50"
+                >
+                  Clear Balance
+                </button>
+              ) : null}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <dt className="text-slate-500">Total Due</dt>
+            <dd className="font-semibold text-slate-900">
+              {formatMaybePeso(totalDueDisplay, bill.roundsToWholePeso)}
+            </dd>
+          </div>
+        </dl>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Payment status
+          <select
+            value={item.paymentStatus}
+            onChange={(event) =>
+              void changePaymentStatus(
+                item,
+                event.target.value as PaymentStatus,
+              )
+            }
+            className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
+          >
+            {PAYMENT_STATUSES.map((status) => (
+              <option key={status} value={status}>
+                {status}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+          Unit status
+          {isAdmin ? (
+            <select
+              value={item.status}
+              onChange={(event) =>
+                void changeStatus(item, event.target.value as UnitStatus)
+              }
+              className={fieldClass}
+            >
+              {UNIT_STATUSES.map((status) => (
+                <option key={status} value={status}>
+                  {status}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="text"
+              value={item.status}
+              readOnly
+              disabled
+              className={`${fieldClass} cursor-not-allowed bg-slate-50 text-slate-600`}
+            />
+          )}
+        </label>
+        <div
+          className={`flex flex-col gap-2 sm:flex-row ${
+            split ? "sm:col-span-2" : ""
+          }`}
+        >
+          {isMobile ? (
+            <>
+              <motion.button
+                type="button"
+                disabled={item.paymentStatus === "Paid"}
+                whileTap={
+                  item.paymentStatus === "Paid" ? undefined : { scale: 0.98 }
+                }
+                onClick={(event) => {
+                  event.stopPropagation();
+                  unlockAudio(audioCtxRef);
+                  void changePaymentStatus(item, "Paid");
+                }}
+                className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+              >
+                Mark as Paid
+              </motion.button>
+              <motion.button
+                type="button"
+                whileTap={{ scale: 0.98 }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void openPaymentHistory(item);
+                }}
+                className={primaryButtonClass}
+              >
+                View History
+              </motion.button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                disabled={item.paymentStatus === "Paid"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void changePaymentStatus(item, "Paid");
+                }}
+                className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+              >
+                Mark as Paid
+              </button>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void openPaymentHistory(item);
+                }}
+                className={primaryButtonClass}
+              >
+                View History
+              </button>
+            </>
+          )}
+        </div>
+        {item.message ? (
+          <p
+            className={`text-sm text-rose-700 ${split ? "sm:col-span-2" : ""}`}
+          >
+            {item.message}
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+
+  async function processReceiptFile(file: File): Promise<{
+    matched: BatchMatchedUnit | null;
+    failed: BatchFailedItem | null;
+  }> {
+    const image = await compressReceiptImage(file);
+    const response = await fetch("/api/extract-receipt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image, mimeType: "image/jpeg" }),
+    });
+    const payload: unknown = await response.json();
+
+    if (!response.ok) {
+      const errorMessage =
+        payload &&
+        typeof payload === "object" &&
+        "error" in payload &&
+        typeof payload.error === "string"
+          ? payload.error
+          : "Receipt extraction failed.";
+      return {
+        matched: null,
+        failed: { fileName: file.name, reason: errorMessage },
+      };
+    }
+
+    const extraction = payload as ReceiptExtraction;
+    if (
+      typeof extraction.current_kwh !== "number" ||
+      !Number.isFinite(extraction.current_kwh)
+    ) {
+      return {
+        matched: null,
+        failed: {
+          fileName: file.name,
+          reason: "The receipt did not include a kWh reading.",
+        },
+      };
+    }
+
+    const unitName =
+      typeof extraction.unit === "string" ? extraction.unit.trim() : "";
+    const matched = findUnitByReceiptName(unitsRef.current, unitName);
+
+    if (!matched) {
+      return {
+        matched: null,
+        failed: {
+          fileName: file.name,
+          reason: unitName
+            ? `No unit matches “${unitName}”.`
+            : "The receipt did not include a unit name.",
+        },
+      };
+    }
+
+    let receiptUrl: string | null = null;
+    try {
+      receiptUrl = await uploadReceiptImage(matched.id, image);
+    } catch (error) {
+      // Still populate OCR fields even if storage fails; note it in the message.
+      const uploadMessage =
+        error instanceof Error
+          ? error.message
+          : "Could not store the receipt image.";
+      setUnits((prev) => {
+        const next = prev.map((unit) =>
+          unit.id === matched.id
+            ? {
+                ...unit,
+                ...unitPatchFromExtraction(extraction, null),
+                message: uploadMessage,
+              }
+            : unit,
+        );
+        unitsRef.current = next;
+        return next;
+      });
+      return {
+        matched: {
+          unitId: matched.id,
+          label: matched.label,
+          baseRent: matched.baseRent,
+        },
+        failed: {
+          fileName: file.name,
+          reason: `Matched ${matched.label}, but receipt image was not stored: ${uploadMessage}`,
+        },
+      };
+    }
+
+    const unitPatch = unitPatchFromExtraction(extraction, receiptUrl);
+    setUnits((prev) => {
+      const next = prev.map((unit) =>
+        unit.id === matched.id ? { ...unit, ...unitPatch } : unit,
+      );
+      unitsRef.current = next;
+      return next;
+    });
+
+    return {
+      matched: {
+        unitId: matched.id,
+        label: matched.label,
+        baseRent: matched.baseRent,
+      },
+      failed: null,
+    };
+  }
+
+  async function scanGlobalReceiptBatch(files: File[]) {
+    if (files.length === 0) {
+      return;
+    }
+
     setScanningReceipt(true);
     setReceiptNotice(null);
+    setReceiptNoticeIsError(false);
+    setBatchMatched([]);
+    setBatchFailed([]);
+    setBatchProgress({ current: 0, total: files.length });
 
-    try {
-      const image = await compressReceiptImage(file);
-      const response = await fetch("/api/extract-receipt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image, mimeType: "image/jpeg" }),
-      });
-      const payload: unknown = await response.json();
+    const matchedUnits: BatchMatchedUnit[] = [];
+    const failedItems: BatchFailedItem[] = [];
+    const matchedIds = new Set<string>();
 
-      if (!response.ok) {
-        const errorMessage =
-          payload &&
-          typeof payload === "object" &&
-          "error" in payload &&
-          typeof payload.error === "string"
-            ? payload.error
-            : "Receipt extraction failed.";
-        throw new Error(errorMessage);
-      }
+    // Process up to 2 at a time to avoid Gemini rate limits.
+    const concurrency = Math.min(2, files.length);
+    let nextIndex = 0;
+    let completed = 0;
 
-      const extraction = payload as ReceiptExtraction;
-      if (
-        typeof extraction.current_kwh !== "number" ||
-        !Number.isFinite(extraction.current_kwh)
-      ) {
-        throw new Error("The receipt did not include a kWh reading.");
-      }
+    async function worker() {
+      while (nextIndex < files.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const file = files[index];
 
-      const unitName =
-        typeof extraction.unit === "string" ? extraction.unit.trim() : "";
-      const matched = findUnitByReceiptName(unitsRef.current, unitName);
+        try {
+          const result = await processReceiptFile(file);
+          if (result.matched && !matchedIds.has(result.matched.unitId)) {
+            matchedIds.add(result.matched.unitId);
+            matchedUnits.push(result.matched);
+          }
+          if (result.failed) {
+            failedItems.push(result.failed);
+          }
+        } catch (error) {
+          failedItems.push({
+            fileName: file.name,
+            reason:
+              error instanceof Error
+                ? error.message
+                : "Receipt extraction failed.",
+          });
+        } finally {
+          completed += 1;
+          setBatchProgress({ current: completed, total: files.length });
+        }
+      }
+    }
 
-      if (!matched) {
-        setReceiptNoticeIsError(true);
-        setReceiptNotice(
-          unitName
-            ? `No unit matches “${unitName}”. Gemini returned that exact unit name.`
-            : "The receipt did not include a unit name.",
-        );
-        return;
-      }
+    await Promise.all(
+      Array.from({ length: concurrency }, () => worker()),
+    );
 
-      let receiptUrl: string | null = null;
-      let uploadMessage: string | null = null;
-      try {
-        receiptUrl = await uploadReceiptImage(matched.id, image);
-      } catch (error) {
-        uploadMessage =
-          error instanceof Error
-            ? error.message
-            : "Could not store the receipt image.";
-      }
+    matchedUnits.sort((a, b) =>
+      a.label.localeCompare(b.label, undefined, { numeric: true }),
+    );
+    setBatchMatched(matchedUnits);
+    setBatchFailed(failedItems);
+    setBatchProgress(null);
+    setScanningReceipt(false);
 
-      const unitPatch: Partial<DashboardUnit> = {
-        currentReading: String(extraction.current_kwh),
-        receiptUrl,
-        message: null,
-      };
-      if (typeof extraction.payment_date === "string" && extraction.payment_date) {
-        unitPatch.paymentDate = extraction.payment_date;
-      }
-      if (
-        typeof extraction.billing_period === "string" &&
-        extraction.billing_period.trim()
-      ) {
-        unitPatch.billingPeriod = extraction.billing_period.trim();
-      }
-      if (
-        typeof extraction.rent_paid === "number" &&
-        Number.isFinite(extraction.rent_paid)
-      ) {
-        unitPatch.rentPaid = String(extraction.rent_paid);
-      }
-      if (
-        typeof extraction.electricity_paid === "number" &&
-        Number.isFinite(extraction.electricity_paid)
-      ) {
-        unitPatch.electricityPaid = String(extraction.electricity_paid);
-      }
-      if (
-        typeof extraction.total_paid === "number" &&
-        Number.isFinite(extraction.total_paid)
-      ) {
-        unitPatch.amountPaid = String(extraction.total_paid);
-      }
-
-      patchUnit(matched.id, unitPatch);
-      setActiveTier(matched.baseRent);
-      setOpenUnitIds((current) => ({
-        ...current,
-        [matched.id]: true,
-      }));
-      setReceiptNoticeIsError(uploadMessage !== null);
-      setReceiptNotice(
-        uploadMessage
-          ? `Filled ${matched.label} from “${unitName}” (${extraction.current_kwh.toLocaleString("en-PH")} kWh). The receipt image was not stored: ${uploadMessage}`
-          : `Filled ${matched.label} from “${unitName}” (${extraction.current_kwh.toLocaleString("en-PH")} kWh). Receipt image saved.`,
-      );
-    } catch (error) {
+    if (matchedUnits.length === 0 && failedItems.length > 0) {
       setReceiptNoticeIsError(true);
       setReceiptNotice(
-        error instanceof Error ? error.message : "Receipt extraction failed.",
+        `Batch finished with ${failedItems.length} issue${failedItems.length === 1 ? "" : "s"} and no matched units.`,
       );
-    } finally {
-      setScanningReceipt(false);
+    } else if (matchedUnits.length > 0) {
+      const summary =
+        failedItems.length === 0
+          ? `Scan Complete — ${matchedUnits.length} Unit${matchedUnits.length === 1 ? "" : "s"} Updated`
+          : `Scan Complete — ${matchedUnits.length} matched, ${failedItems.length} need attention`;
+      announceSuccess(summary);
+      if (failedItems.length > 0) {
+        setReceiptNoticeIsError(false);
+        setReceiptNotice(
+          `Batch finished: ${matchedUnits.length} matched, ${failedItems.length} need attention.`,
+        );
+      }
+    } else {
+      setReceiptNoticeIsError(false);
+      setReceiptNotice("Batch finished with no matched units.");
     }
   }
 
@@ -1449,18 +2193,29 @@ export default function Home() {
             </div>
           )}
           <div className="flex flex-col gap-2 sm:flex-1 sm:flex-row sm:items-center sm:justify-center">
-            <label className={`${primaryButtonClass} cursor-pointer`}>
-              {scanningReceipt ? "Scanning…" : "Scan Global Receipt"}
+            <label
+              className={`${primaryButtonClass} cursor-pointer ${
+                scanningReceipt ? "pointer-events-none opacity-60" : ""
+              }`}
+            >
+              {scanningReceipt
+                ? batchProgress
+                  ? `Scanning ${batchProgress.current}/${batchProgress.total}…`
+                  : "Scanning…"
+                : "Scan Global Receipt"}
               <input
                 type="file"
                 accept="image/*"
+                multiple
                 disabled={scanningReceipt}
                 className="sr-only"
                 onChange={(event) => {
-                  const file = event.target.files?.[0];
+                  const selected = event.target.files
+                    ? Array.from(event.target.files)
+                    : [];
                   event.target.value = "";
-                  if (file) {
-                    void scanGlobalReceipt(file);
+                  if (selected.length > 0) {
+                    void scanGlobalReceiptBatch(selected);
                   }
                 }}
               />
@@ -1482,6 +2237,33 @@ export default function Home() {
           <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
             Units
           </h1>
+          {batchProgress ? (
+            <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <p className="font-medium text-slate-800">
+                  Scanning receipt {batchProgress.current} of{" "}
+                  {batchProgress.total}…
+                </p>
+                <p className="text-slate-500">
+                  {Math.round(
+                    (batchProgress.current / batchProgress.total) * 100,
+                  )}
+                  %
+                </p>
+              </div>
+              <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100">
+                <div
+                  className="h-full rounded-full bg-slate-900 transition-all duration-300"
+                  style={{
+                    width: `${Math.max(
+                      4,
+                      (batchProgress.current / batchProgress.total) * 100,
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          ) : null}
           {receiptNotice ? (
             <p
               className={`rounded-xl px-4 py-3 text-sm ${
@@ -1493,8 +2275,50 @@ export default function Home() {
               {receiptNotice}
             </p>
           ) : null}
+          {!scanningReceipt &&
+          (batchMatched.length > 0 || batchFailed.length > 0) ? (
+            <div className="rounded-xl border border-slate-200 bg-white px-4 py-4">
+              {batchMatched.length > 0 ? (
+                <div>
+                  <p className="text-sm font-medium text-slate-800">
+                    Matched Units
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {batchMatched.map((unit) => (
+                      <button
+                        key={unit.unitId}
+                        type="button"
+                        onClick={() => focusMatchedUnit(unit)}
+                        className="rounded-full bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-700"
+                      >
+                        {unit.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              {batchFailed.length > 0 ? (
+                <div className={batchMatched.length > 0 ? "mt-4" : undefined}>
+                  <p className="text-sm font-medium text-rose-800">
+                    Needs Attention / Failed
+                  </p>
+                  <ul className="mt-2 space-y-1.5 text-sm text-rose-700">
+                    {batchFailed.map((item) => (
+                      <li
+                        key={`${item.fileName}-${item.reason}`}
+                        className="rounded-lg bg-rose-50 px-3 py-2"
+                      >
+                        <span className="font-medium">{item.fileName}</span>
+                        <span className="text-rose-600"> — {item.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <p className="max-w-2xl text-sm leading-6 text-slate-600 sm:text-base">
-            Filter by monthly rent, update occupancy, and read handwritten
+            Filter by monthly rent, update occupancy, and batch-scan handwritten
             receipts for occupied units.
           </p>
         </header>
@@ -1511,408 +2335,250 @@ export default function Home() {
             aria-label="Rent tiers"
             className="flex w-max min-w-full gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-slate-200 md:grid md:w-full md:grid-cols-3"
           >
-          {RENT_TIERS.map((tier) => {
-            const count = units.filter((item) => item.baseRent === tier).length;
-            const selected = activeTier === tier;
-            return (
-              <button
-                key={tier}
-                type="button"
-                role="tab"
-                aria-selected={selected}
-                onClick={() => setActiveTier(tier)}
-                className={`min-h-12 min-w-[11.5rem] shrink-0 flex-1 rounded-xl px-4 py-3 text-left transition md:min-w-0 ${
-                  selected
-                    ? "bg-slate-900 text-white"
-                    : "text-slate-700 hover:bg-slate-100"
-                }`}
-              >
-                <span className="block text-sm font-medium opacity-80">
-                  Base rent
-                </span>
-                <span className="mt-1 flex items-baseline justify-between gap-3">
-                  <span className="text-lg font-semibold">{peso(tier)}</span>
-                  <span className="text-xs">{count} units</span>
-                </span>
-              </button>
-            );
-          })}
+            {RENT_TIERS.map((tier) => {
+              const count = units.filter((item) => item.baseRent === tier).length;
+              const selected = activeTier === tier;
+              if (isMobile) {
+                return (
+                  <motion.button
+                    key={tier}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => setActiveTier(tier)}
+                    className="relative min-h-12 min-w-[11.5rem] shrink-0 flex-1 overflow-hidden rounded-xl px-4 py-3 text-left"
+                  >
+                    {selected ? (
+                      <motion.span
+                        layoutId="activeRentTab"
+                        className="absolute inset-0 rounded-xl bg-slate-900"
+                        transition={{
+                          type: "spring",
+                          stiffness: 380,
+                          damping: 32,
+                        }}
+                      />
+                    ) : null}
+                    <span
+                      className={`relative z-10 block text-sm font-medium opacity-80 ${
+                        selected ? "text-white" : "text-slate-700"
+                      }`}
+                    >
+                      Base rent
+                    </span>
+                    <span
+                      className={`relative z-10 mt-1 flex items-baseline justify-between gap-3 ${
+                        selected ? "text-white" : "text-slate-700"
+                      }`}
+                    >
+                      <span className="text-lg font-semibold">{peso(tier)}</span>
+                      <span className="text-xs">{count} units</span>
+                    </span>
+                  </motion.button>
+                );
+              }
+
+              return (
+                <button
+                  key={tier}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  onClick={() => setActiveTier(tier)}
+                  className={`min-h-12 min-w-[11.5rem] shrink-0 flex-1 rounded-xl px-4 py-3 text-left md:min-w-0 ${
+                    selected
+                      ? "bg-slate-900 text-white"
+                      : "text-slate-700 hover:bg-slate-100"
+                  }`}
+                >
+                  <span className="block text-sm font-medium opacity-80">
+                    Base rent
+                  </span>
+                  <span className="mt-1 flex items-baseline justify-between gap-3">
+                    <span className="text-lg font-semibold">{peso(tier)}</span>
+                    <span className="text-xs">{count} units</span>
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
 
         {loading ? (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {Array.from({ length: 3 }, (_, index) => (
-              <div
-                key={index}
-                className="h-64 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200"
-              />
-            ))}
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-[minmax(0,0.35fr)_minmax(0,0.65fr)]">
+            <div className="h-64 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200" />
+            <div className="hidden h-64 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200 md:block" />
           </div>
         ) : visibleUnits.length === 0 ? (
           <p className="rounded-2xl bg-white px-6 py-16 text-center text-slate-500 ring-1 ring-slate-200">
             No units at {peso(activeTier)}.
           </p>
         ) : (
-          <section className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {visibleUnits.map((item) => {
-              const expanded = openUnitIds[item.id] === true;
-              const bill = meterBill(
-                item.previousReading,
-                item.currentReading,
-                electricityRate,
-                item.baseRent,
-                item.balance,
-              );
-              const totalDueDisplay =
-                bill.totalAmountDue == null
-                  ? item.baseRent + item.balance
-                  : bill.totalAmountDue;
-              return (
-              <article
-                key={item.id}
-                className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200"
-              >
-                <button
-                  type="button"
-                  aria-expanded={expanded}
-                  onClick={() =>
-                    setOpenUnitIds((current) => ({
-                      ...current,
-                      [item.id]: !current[item.id],
-                    }))
+          <>
+            <section className="grid grid-cols-1 gap-4 md:hidden">
+              <AnimatePresence mode="wait" initial={false}>
+                <motion.div
+                  key={activeTier}
+                  initial={
+                    reduceMotion ? false : { opacity: 0, y: 6 }
                   }
-                  className="flex w-full items-center gap-3 px-4 py-3 text-left"
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduceMotion ? undefined : { opacity: 0, y: -4 }}
+                  transition={{ duration: 0.22, ease: APPLE_EASE }}
+                  className="grid grid-cols-1 gap-4"
                 >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h2 className="text-lg font-semibold">{item.label}</h2>
+                  {visibleUnits.map((item) => {
+                    const expanded = openUnitIds[item.id] === true;
+                    return (
+                      <motion.article
+                        key={item.id}
+                        whileTap={{ scale: 0.98 }}
+                        className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200"
+                      >
+                        <motion.button
+                          type="button"
+                          aria-expanded={expanded}
+                          whileTap={{ scale: 0.98 }}
+                          onClick={() =>
+                            setOpenUnitIds((current) => ({
+                              ...current,
+                              [item.id]: !current[item.id],
+                            }))
+                          }
+                          className="flex w-full items-center gap-3 px-4 py-3 text-left"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <h2 className="text-lg font-semibold">
+                                {item.label}
+                              </h2>
+                              <PaymentStatusBadge
+                                status={item.paymentStatus}
+                                isMobile
+                                className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone(item.paymentStatus)}`}
+                              />
+                              <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
+                                {item.status}
+                              </span>
+                            </div>
+                          </div>
+                          <motion.svg
+                            viewBox="0 0 20 20"
+                            fill="currentColor"
+                            aria-hidden="true"
+                            animate={{ rotate: expanded ? 180 : 0 }}
+                            transition={{ duration: 0.22, ease: APPLE_EASE }}
+                            className="h-5 w-5 shrink-0 text-slate-500"
+                          >
+                            <path
+                              fillRule="evenodd"
+                              d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.17l3.71-3.94a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z"
+                              clipRule="evenodd"
+                            />
+                          </motion.svg>
+                        </motion.button>
+                        <AnimatePresence initial={false}>
+                          {expanded ? (
+                            <motion.div
+                              key={`${item.id}-body`}
+                              initial={
+                                reduceMotion
+                                  ? false
+                                  : { height: 0, opacity: 0 }
+                              }
+                              animate={{ height: "auto", opacity: 1 }}
+                              exit={
+                                reduceMotion
+                                  ? undefined
+                                  : { height: 0, opacity: 0 }
+                              }
+                              transition={{
+                                duration: 0.22,
+                                ease: APPLE_EASE,
+                              }}
+                              className="overflow-hidden"
+                            >
+                              <div className="px-4 pb-4">
+                                {renderUnitEditor(item)}
+                              </div>
+                            </motion.div>
+                          ) : null}
+                        </AnimatePresence>
+                      </motion.article>
+                    );
+                  })}
+                </motion.div>
+              </AnimatePresence>
+            </section>
+
+            <section className="hidden md:grid md:grid-cols-[minmax(0,0.35fr)_minmax(0,0.65fr)] md:items-start md:gap-4">
+              <div className="max-h-[calc(100vh-8rem)] space-y-2 overflow-y-auto rounded-2xl bg-white p-2 shadow-sm ring-1 ring-slate-200">
+                {visibleUnits.map((item) => {
+                  const selected = item.id === selectedDesktopUnitId;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => setSelectedDesktopUnitId(item.id)}
+                      className={`flex w-full items-center justify-between gap-3 rounded-xl px-3 py-3 text-left transition ${
+                        selected
+                          ? "bg-slate-900 text-white ring-2 ring-slate-900"
+                          : "bg-slate-50 text-slate-900 hover:bg-slate-100 ring-1 ring-transparent"
+                      }`}
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-base font-semibold">
+                          {item.label}
+                        </span>
+                        <span
+                          className={`mt-1 block text-xs ${
+                            selected ? "text-slate-300" : "text-slate-500"
+                          }`}
+                        >
+                          {item.status}
+                        </span>
+                      </span>
                       <span
-                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone(item.paymentStatus)}`}
+                        className={`shrink-0 rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${
+                          selected
+                            ? "bg-white/10 text-white ring-white/20"
+                            : statusTone(item.paymentStatus)
+                        }`}
                       >
                         {item.paymentStatus}
                       </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="sticky top-4 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+                {selectedDesktopUnit ? (
+                  <>
+                    <div className="mb-5 flex flex-wrap items-center gap-2 border-b border-slate-100 pb-4">
+                      <h2 className="text-xl font-semibold tracking-tight">
+                        {selectedDesktopUnit.label}
+                      </h2>
+                      <PaymentStatusBadge
+                        status={selectedDesktopUnit.paymentStatus}
+                        isMobile={false}
+                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusTone(selectedDesktopUnit.paymentStatus)}`}
+                      />
                       <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
-                        {item.status}
+                        {selectedDesktopUnit.status}
                       </span>
                     </div>
-                  </div>
-                  <svg
-                    viewBox="0 0 20 20"
-                    fill="currentColor"
-                    aria-hidden="true"
-                    className={`h-5 w-5 shrink-0 text-slate-500 transition-transform duration-300 ${expanded ? "rotate-180" : ""}`}
-                  >
-                    <path
-                      fillRule="evenodd"
-                      d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.17l3.71-3.94a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z"
-                      clipRule="evenodd"
-                    />
-                  </svg>
-                </button>
-                <div
-                  className={`grid transition-all duration-300 ease-in-out ${expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"}`}
-                >
-                  <div className="overflow-hidden" inert={expanded ? undefined : true}>
-                    <div className="flex flex-col gap-4 px-4 pb-4">
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Previous kWh
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          inputMode="decimal"
-                          value={item.previousReading}
-                          readOnly={!isAdmin}
-                          disabled={!isAdmin}
-                          onChange={(event) => {
-                            if (!isAdmin) {
-                              return;
-                            }
-                            patchUnit(item.id, {
-                              previousReading: event.target.value,
-                              message: null,
-                            });
-                          }}
-                          placeholder="Previous kWh"
-                          className={`${fieldClass}${
-                            isAdmin
-                              ? ""
-                              : " cursor-not-allowed bg-slate-50 text-slate-600"
-                          }`}
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Current kWh
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          inputMode="decimal"
-                          value={item.currentReading}
-                          onChange={(event) =>
-                            patchUnit(item.id, {
-                              currentReading: event.target.value,
-                              message: null,
-                            })
-                          }
-                          placeholder="Current kWh"
-                          className={fieldClass}
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Payment Date
-                        <input
-                          type="date"
-                          value={item.paymentDate}
-                          onChange={(event) =>
-                            patchUnit(item.id, {
-                              paymentDate: event.target.value,
-                              message: null,
-                            })
-                          }
-                          className={fieldClass}
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Billing Period
-                        <input
-                          type="text"
-                          value={item.billingPeriod}
-                          onChange={(event) =>
-                            patchUnit(item.id, {
-                              billingPeriod: event.target.value,
-                              message: null,
-                            })
-                          }
-                          placeholder="October - November 2026"
-                          className={fieldClass}
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Rent Paid
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          inputMode="decimal"
-                          value={item.rentPaid}
-                          onChange={(event) =>
-                            patchUnit(item.id, {
-                              rentPaid: event.target.value,
-                              message: null,
-                            })
-                          }
-                          placeholder="2500"
-                          className={fieldClass}
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Electricity Paid
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          inputMode="decimal"
-                          value={item.electricityPaid}
-                          onChange={(event) =>
-                            patchUnit(item.id, {
-                              electricityPaid: event.target.value,
-                              message: null,
-                            })
-                          }
-                          placeholder="126"
-                          className={fieldClass}
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Total Paid
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          inputMode="decimal"
-                          value={item.amountPaid}
-                          onChange={(event) =>
-                            patchUnit(item.id, {
-                              amountPaid: event.target.value,
-                              message: null,
-                            })
-                          }
-                          placeholder="2626"
-                          className={fieldClass}
-                        />
-                      </label>
-                      {item.receiptUrl ? (
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setReceiptPreview(item.receiptUrl);
-                          }}
-                          className="overflow-hidden rounded-xl ring-1 ring-slate-200"
-                        >
-                          <img
-                            src={item.receiptUrl}
-                            alt={`Receipt for ${item.label}`}
-                            className="h-28 w-full object-cover"
-                          />
-                        </button>
-                      ) : null}
-                      <dl className="grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm">
-                        <div className="flex items-center justify-between gap-3">
-                          <dt className="text-slate-500">Consumed kWh</dt>
-                          <dd className="font-semibold text-slate-900">
-                            {bill.consumed === null
-                              ? "—"
-                              : `${bill.roundsToWholePeso ? bill.consumed.toFixed(0) : bill.consumed.toLocaleString("en-PH")} kWh`}
-                          </dd>
-                        </div>
-                        <div className="flex items-center justify-between gap-3">
-                          <dt className="text-slate-500">Electricity Charge</dt>
-                          <dd className="font-medium">
-                            {formatMaybePeso(bill.electricityCharge, bill.roundsToWholePeso)}
-                          </dd>
-                        </div>
-                        <div className="flex items-center justify-between gap-3">
-                          <dt className="text-slate-500">Remaining Balance</dt>
-                          <dd className="flex items-center gap-2">
-                            <span
-                              className={`font-semibold ${
-                                item.balance > 0
-                                  ? "text-amber-700"
-                                  : "text-slate-400"
-                              }`}
-                            >
-                              {peso(item.balance)}
-                            </span>
-                            {isAdmin && item.balance > 0 ? (
-                              <button
-                                type="button"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  void clearBalance(item);
-                                }}
-                                className="rounded-md px-2 py-1 text-xs font-medium text-rose-700 ring-1 ring-rose-200 hover:bg-rose-50"
-                              >
-                                Clear Balance
-                              </button>
-                            ) : null}
-                          </dd>
-                        </div>
-                        <div className="flex items-center justify-between gap-3">
-                          <dt className="text-slate-500">Total Due</dt>
-                          <dd className="font-semibold text-slate-900">
-                            {formatMaybePeso(
-                              totalDueDisplay,
-                              bill.roundsToWholePeso,
-                            )}
-                          </dd>
-                        </div>
-                      </dl>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Payment status
-                        <select
-                          value={item.paymentStatus}
-                          onChange={(event) =>
-                            void changePaymentStatus(
-                              item,
-                              event.target.value as PaymentStatus,
-                            )
-                          }
-                          className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
-                        >
-                          {PAYMENT_STATUSES.map((status) => (
-                            <option key={status} value={status}>
-                              {status}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Unit status
-                        {isAdmin ? (
-                          <select
-                            value={item.status}
-                            onChange={(event) =>
-                              void changeStatus(
-                                item,
-                                event.target.value as UnitStatus,
-                              )
-                            }
-                            className={fieldClass}
-                          >
-                            {UNIT_STATUSES.map((status) => (
-                              <option key={status} value={status}>
-                                {status}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <input
-                            type="text"
-                            value={item.status}
-                            readOnly
-                            disabled
-                            className={`${fieldClass} cursor-not-allowed bg-slate-50 text-slate-600`}
-                          />
-                        )}
-                      </label>
-                      <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-                        Payment method
-                        <select
-                          value={item.paymentMethod}
-                          onChange={(event) =>
-                            void changeMethod(
-                              item,
-                              event.target.value as PaymentMethod,
-                            )
-                          }
-                          className={fieldClass}
-                        >
-                          <option value="" disabled>
-                            Choose method
-                          </option>
-                          {PAYMENT_METHODS.map((method) => (
-                            <option key={method} value={method}>
-                              {method}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <div className="flex flex-col gap-2 sm:flex-row">
-                        <button
-                          type="button"
-                          disabled={item.paymentStatus === "Paid"}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void changePaymentStatus(item, "Paid");
-                          }}
-                          className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
-                        >
-                          Mark as Paid
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void openPaymentHistory(item);
-                          }}
-                          className={primaryButtonClass}
-                        >
-                          View History
-                        </button>
-                      </div>
-                      {item.message ? (
-                        <p className="text-sm text-rose-700">{item.message}</p>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-              </article>
-              );
-            })}
-          </section>
+                    {renderUnitEditor(selectedDesktopUnit, { split: true })}
+                  </>
+                ) : (
+                  <p className="text-sm text-slate-500">
+                    Select a unit to edit payment details.
+                  </p>
+                )}
+              </div>
+            </section>
+          </>
         )}
 
         <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
@@ -2416,6 +3082,15 @@ export default function Home() {
           />
         </div>
       ) : null}
+      <AnimatePresence>
+        {isMobile && mobileSuccess ? (
+          <MobileSuccessOverlay
+            key={mobileSuccess}
+            message={mobileSuccess}
+            onDismiss={() => setMobileSuccess(null)}
+          />
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }
