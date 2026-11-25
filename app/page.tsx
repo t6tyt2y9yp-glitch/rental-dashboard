@@ -22,6 +22,23 @@ const ADMIN_EMAIL = "kylemata313131@gmail.com";
 const DISPLAY_NAME_BY_EMAIL: Record<string, string> = {
   [ADMIN_EMAIL]: "Kyle",
 };
+const ELECTRICITY_RATE_STORAGE_KEY = "rental-dashboard:electricity-rate";
+const ELECTRICITY_RATE_DISMISSED_KEY =
+  "rental-dashboard:electricity-rate-dismissed-at";
+const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+] as const;
 
 type RentTier = (typeof RENT_TIERS)[number];
 type UnitStatus = (typeof UNIT_STATUSES)[number];
@@ -124,6 +141,173 @@ function asBalance(value: unknown) {
   }
   const amount = typeof value === "number" ? value : Number(value);
   return Number.isFinite(amount) ? amount : 0;
+}
+
+function readingToInput(value: unknown) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  const amount = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(amount) ? String(amount) : "";
+}
+
+function moneyToInput(value: unknown) {
+  return readingToInput(value);
+}
+
+function getNextBillingPeriod(currentPeriod: string) {
+  const trimmed = currentPeriod.trim();
+  const match = /^([A-Za-z]+)\s*-\s*([A-Za-z]+)\s+(\d{4})$/.exec(trimmed);
+  if (match) {
+    const endName = match[2];
+    const year = Number(match[3]);
+    const endIndex = MONTH_NAMES.findIndex(
+      (month) => month.toLowerCase() === endName.toLowerCase(),
+    );
+    if (endIndex >= 0 && Number.isFinite(year)) {
+      const startIndex = endIndex;
+      const nextEndIndex = (endIndex + 1) % 12;
+      const endYear = endIndex === 11 ? year + 1 : year;
+      return `${MONTH_NAMES[startIndex]} - ${MONTH_NAMES[nextEndIndex]} ${endYear}`;
+    }
+  }
+
+  const now = new Date();
+  const startIndex = now.getMonth();
+  const nextEndIndex = (startIndex + 1) % 12;
+  const endYear =
+    startIndex === 11 ? now.getFullYear() + 1 : now.getFullYear();
+  return `${MONTH_NAMES[startIndex]} - ${MONTH_NAMES[nextEndIndex]} ${endYear}`;
+}
+
+function readStoredElectricityRate() {
+  try {
+    return localStorage.getItem(ELECTRICITY_RATE_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeStoredElectricityRate(value: string) {
+  try {
+    if (!value) {
+      localStorage.removeItem(ELECTRICITY_RATE_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(ELECTRICITY_RATE_STORAGE_KEY, value);
+  } catch {
+    // Ignore storage failures (private mode, etc.).
+  }
+}
+
+function clearStoredElectricityRate() {
+  writeStoredElectricityRate("");
+}
+
+function readRateNoticeDismissedAt() {
+  try {
+    return localStorage.getItem(ELECTRICITY_RATE_DISMISSED_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeRateNoticeDismissedAt(iso: string) {
+  try {
+    localStorage.setItem(ELECTRICITY_RATE_DISMISSED_KEY, iso);
+  } catch {
+    // Ignore storage failures (private mode, etc.).
+  }
+}
+
+type ElectricityRateMeta = {
+  rate: number | null;
+  updatedBy: string | null;
+  updatedAt: string | null;
+};
+
+type ElectricityRateNotice = {
+  rate: number | null;
+  updatedBy: string;
+  updatedAt: string;
+};
+
+function rateMetaFromUnitRows(rows: UnitRow[]): ElectricityRateMeta {
+  let best: ElectricityRateMeta = {
+    rate: null,
+    updatedBy: null,
+    updatedAt: null,
+  };
+  let bestTime = Number.NEGATIVE_INFINITY;
+
+  for (const row of rows) {
+    const updatedAt =
+      typeof row.electricity_rate_updated_at === "string" &&
+      row.electricity_rate_updated_at
+        ? row.electricity_rate_updated_at
+        : null;
+    const updatedBy =
+      typeof row.electricity_rate_updated_by === "string" &&
+      row.electricity_rate_updated_by
+        ? row.electricity_rate_updated_by
+        : null;
+    const raw = row.electricity_rate;
+    const parsed =
+      raw === null || raw === undefined || raw === ""
+        ? null
+        : Number(raw);
+    const rate =
+      parsed !== null && Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    const time = updatedAt ? Date.parse(updatedAt) : Number.NEGATIVE_INFINITY;
+
+    if (
+      time > bestTime ||
+      (time === bestTime && best.rate == null && rate != null)
+    ) {
+      bestTime = time;
+      best = { rate, updatedBy, updatedAt };
+    }
+  }
+
+  return best;
+}
+
+function formatRateNoticeTime(iso: string) {
+  try {
+    return `${new Date(iso).toLocaleString("en-PH", {
+      timeZone: "Asia/Singapore",
+      dateStyle: "medium",
+      timeStyle: "short",
+    })} (Asia/Singapore)`;
+  } catch {
+    return iso;
+  }
+}
+
+function formatRateNoticeActor(email: string | null | undefined) {
+  if (!email) {
+    return "someone";
+  }
+  return DISPLAY_NAME_BY_EMAIL[email] ?? email;
+}
+
+function shouldShowRateNotice(updatedAt: string | null | undefined) {
+  if (!updatedAt) {
+    return false;
+  }
+  const dismissedAt = readRateNoticeDismissedAt();
+  if (!dismissedAt) {
+    return true;
+  }
+  const updatedMs = Date.parse(updatedAt);
+  const dismissedMs = Date.parse(dismissedAt);
+  if (!Number.isFinite(updatedMs)) {
+    return false;
+  }
+  if (!Number.isFinite(dismissedMs)) {
+    return true;
+  }
+  return updatedMs > dismissedMs;
 }
 
 function useIsMobile() {
@@ -423,24 +607,36 @@ function mapUnits(unitRows: UnitRow[], paymentRows: PaymentRow[]): DashboardUnit
         label,
         baseRent,
         status: asUnitStatus(row.status),
-        paymentStatus: asPaymentStatus(payment?.status ?? row.payment_status),
+        paymentStatus: asPaymentStatus(row.payment_status ?? payment?.status),
         paymentMethod: asPaymentMethod(
-          payment?.payment_method ?? payment?.method ?? row.payment_method,
+          row.payment_method ?? payment?.payment_method ?? payment?.method,
         ),
+        // Don't re-link last month's Payments row after a new-month reset.
         paymentId:
-          payment?.id === undefined || payment?.id === null
+          asPaymentStatus(row.payment_status) === "Unpaid" ||
+          payment?.id === undefined ||
+          payment?.id === null
             ? null
             : String(payment.id),
-        previousReading: "",
-        currentReading: "",
-        paymentDate: "",
-        billingPeriod: "",
-        rentPaid: "",
-        electricityPaid: "",
-        amountPaid: "",
+        previousReading: readingToInput(
+          row.previous_reading ?? row.previousReading,
+        ),
+        currentReading: readingToInput(
+          row.current_reading ?? row.currentReading,
+        ),
+        paymentDate:
+          typeof row.payment_date === "string" && row.payment_date
+            ? row.payment_date.slice(0, 10)
+            : "",
+        billingPeriod:
+          typeof row.billing_period === "string" ? row.billing_period.trim() : "",
+        rentPaid: moneyToInput(row.rent_paid),
+        electricityPaid: moneyToInput(row.electricity_paid),
+        amountPaid: moneyToInput(row.total_paid ?? row.amount_paid),
         balance: asBalance(row.balance),
+        // Units.receipt_url is the current-month draft; do not fall back to ledger history.
         receiptUrl:
-          typeof payment?.receipt_url === "string" ? payment.receipt_url : null,
+          typeof row.receipt_url === "string" ? row.receipt_url : null,
         message: null,
       },
     ];
@@ -700,9 +896,86 @@ function findUnitByReceiptName(units: DashboardUnit[], unitName: string) {
   );
 }
 
+function hasFiniteInput(value: string) {
+  if (!value.trim()) {
+    return false;
+  }
+  return Number.isFinite(Number(value));
+}
+
+function ocrMoneyMismatch(item: DashboardUnit) {
+  if (
+    !hasFiniteInput(item.rentPaid) ||
+    !hasFiniteInput(item.electricityPaid) ||
+    !hasFiniteInput(item.amountPaid)
+  ) {
+    return false;
+  }
+  const rent = Number(item.rentPaid);
+  const electricity = Number(item.electricityPaid);
+  const total = Number(item.amountPaid);
+  return Math.abs(rent + electricity - total) > 0.009;
+}
+
+function ocrReadingMismatch(item: DashboardUnit) {
+  if (
+    !hasFiniteInput(item.previousReading) ||
+    !hasFiniteInput(item.currentReading)
+  ) {
+    return false;
+  }
+  return Number(item.currentReading) < Number(item.previousReading);
+}
+
+function ReceiptThumbnail({
+  receiptUrl,
+  label,
+  className,
+  onOpen,
+}: {
+  receiptUrl: string;
+  label: string;
+  className?: string;
+  onOpen: () => void;
+}) {
+  const [expired, setExpired] = useState(false);
+
+  if (!receiptUrl || expired) {
+    return (
+      <div
+        className={`rounded-xl bg-slate-50 px-3 py-6 text-center text-sm text-slate-500 ring-1 ring-slate-200 ${className ?? ""}`}
+      >
+        Image archived/expired
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpen();
+      }}
+      className={`group overflow-hidden rounded-xl bg-slate-50 text-left ring-1 ring-slate-200 ${className ?? ""}`}
+    >
+      <img
+        src={receiptUrl}
+        alt={`Receipt for ${label}`}
+        className="h-36 w-full object-cover transition group-hover:opacity-95 sm:h-40"
+        onError={() => setExpired(true)}
+      />
+      <span className="block px-3 py-2 text-xs font-medium text-slate-600">
+        Tap to verify receipt photo
+      </span>
+    </button>
+  );
+}
+
 function unitPatchFromExtraction(
   extraction: ReceiptExtraction,
   receiptUrl: string | null,
+  options?: { allowBillingPeriod?: boolean },
 ): Partial<DashboardUnit> {
   const unitPatch: Partial<DashboardUnit> = {
     currentReading: String(extraction.current_kwh),
@@ -713,6 +986,7 @@ function unitPatchFromExtraction(
     unitPatch.paymentDate = extraction.payment_date;
   }
   if (
+    options?.allowBillingPeriod &&
     typeof extraction.billing_period === "string" &&
     extraction.billing_period.trim()
   ) {
@@ -833,8 +1107,15 @@ export default function Home() {
   const [savingExpense, setSavingExpense] = useState(false);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [ledgerSearch, setLedgerSearch] = useState("");
-  const [ledgerMonth, setLedgerMonth] = useState("");
+  const [ledgerMonth, setLedgerMonth] = useState(""); // "" = All Months
   const [electricityRateInput, setElectricityRateInput] = useState("");
+  const [electricityRateNotice, setElectricityRateNotice] =
+    useState<ElectricityRateNotice | null>(null);
+  const [startingNewMonth, setStartingNewMonth] = useState(false);
+  const lastRateUpdatedAtRef = useRef<string | null>(null);
+  const persistRateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const [scanningReceipt, setScanningReceipt] = useState(false);
   const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
   const [batchMatched, setBatchMatched] = useState<BatchMatchedUnit[]>([]);
@@ -856,13 +1137,63 @@ export default function Home() {
   const isAdmin = isAdminEmail(user?.email);
   const roleLabel = isAdmin ? "Admin" : "Staff";
 
-  const parsedElectricityRate = Number(electricityRateInput);
-  const electricityRate =
+  const hasValidElectricityRate =
     electricityRateInput !== "" &&
-    Number.isFinite(parsedElectricityRate) &&
-    parsedElectricityRate >= 0
-      ? electricityRateInput
-      : null;
+    Number.isFinite(Number(electricityRateInput)) &&
+    Number(electricityRateInput) > 0;
+  // Never fall back to a default rate when the input is cleared or invalid.
+  const electricityRate = hasValidElectricityRate ? electricityRateInput : null;
+  const electricityRateRequiredMessage =
+    "Enter an Electricity Rate (₱ / kWh) at the top before marking as paid.";
+  const billingPeriodPlaceholder = getNextBillingPeriod("");
+
+  function applyElectricityRateMeta(
+    meta: ElectricityRateMeta,
+    options?: { showNotice?: boolean },
+  ) {
+    if (meta.rate != null) {
+      const text = String(meta.rate);
+      setElectricityRateInput(text);
+      writeStoredElectricityRate(text);
+    } else {
+      setElectricityRateInput("");
+      clearStoredElectricityRate();
+    }
+
+    if (meta.updatedAt) {
+      lastRateUpdatedAtRef.current = meta.updatedAt;
+    }
+
+    if (
+      options?.showNotice &&
+      meta.updatedAt &&
+      shouldShowRateNotice(meta.updatedAt)
+    ) {
+      setElectricityRateNotice({
+        rate: meta.rate,
+        updatedBy: formatRateNoticeActor(meta.updatedBy),
+        updatedAt: meta.updatedAt,
+      });
+    }
+  }
+
+  function dismissElectricityRateNotice() {
+    const stamp =
+      electricityRateNotice?.updatedAt ?? new Date().toISOString();
+    writeRateNoticeDismissedAt(stamp);
+    setElectricityRateNotice(null);
+  }
+
+  useEffect(() => {
+    const cached = readStoredElectricityRate();
+    if (
+      cached !== "" &&
+      Number.isFinite(Number(cached)) &&
+      Number(cached) > 0
+    ) {
+      setElectricityRateInput(cached);
+    }
+  }, []);
 
   useEffect(() => {
     if (!supabase) {
@@ -934,12 +1265,27 @@ export default function Home() {
       const [
         { data: unitRows, error: unitError },
         expenseResult,
-        { data: paymentRows, error: paymentError },
+        paymentResult,
       ] = await Promise.all([
         supabase.from("Units").select("*"),
         supabase.from("Expenses").select("id, description, amount, expense_date"),
-        supabase.from("Payments").select("*"),
+        supabase
+          .from("Payments")
+          .select("*")
+          .order("payment_date", { ascending: false })
+          .order("created_at", { ascending: false }),
       ]);
+
+      let paymentRows = paymentResult.data;
+      let paymentError = paymentResult.error;
+      if (paymentError && /payment_date|created_at/i.test(paymentError.message)) {
+        const fallback = await supabase
+          .from("Payments")
+          .select("*")
+          .order("created_at", { ascending: false });
+        paymentRows = fallback.data;
+        paymentError = fallback.error;
+      }
 
       if (cancelled) {
         return;
@@ -969,13 +1315,17 @@ export default function Home() {
         return;
       }
 
+      const safeUnitRows = unitRows ?? [];
       const safePaymentRows = paymentError ? [] : (paymentRows ?? []);
-      const mapped = mapUnits(unitRows ?? [], safePaymentRows).sort((a, b) =>
+      const mapped = mapUnits(safeUnitRows, safePaymentRows).sort((a, b) =>
         a.label.localeCompare(b.label, undefined, { numeric: true }),
       );
       const labels = new Map(mapped.map((unit) => [unit.id, unit.label]));
       setUnits(mapped);
       setLedger(paymentsToLedger(safePaymentRows, labels));
+
+      const rateMeta = rateMetaFromUnitRows(safeUnitRows);
+      applyElectricityRateMeta(rateMeta, { showNotice: true });
 
       if (paymentError) {
         setLoadError(paymentError.message);
@@ -995,6 +1345,60 @@ export default function Home() {
       cancelled = true;
     };
   }, [authReady, sessionUserId]);
+
+  useEffect(() => {
+    if (!supabase || !sessionUserId) {
+      return;
+    }
+
+    const channel = supabase
+      .channel("electricity-rate-changes")
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "Units",
+        },
+        (payload) => {
+          const next = payload.new as UnitRow;
+          const prev = payload.old as UnitRow | undefined;
+          const nextUpdatedAt =
+            typeof next.electricity_rate_updated_at === "string"
+              ? next.electricity_rate_updated_at
+              : null;
+          const prevUpdatedAt =
+            typeof prev?.electricity_rate_updated_at === "string"
+              ? prev.electricity_rate_updated_at
+              : null;
+          const nextRate = next.electricity_rate;
+          const prevRate = prev?.electricity_rate;
+
+          const rateChanged =
+            nextRate !== prevRate || nextUpdatedAt !== prevUpdatedAt;
+          if (!rateChanged) {
+            return;
+          }
+
+          if (
+            nextUpdatedAt &&
+            lastRateUpdatedAtRef.current === nextUpdatedAt
+          ) {
+            // Already applied from local save / prior event for this stamp.
+            return;
+          }
+
+          applyElectricityRateMeta(rateMetaFromUnitRows([next]), {
+            showNotice: true,
+          });
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [sessionUserId]);
 
   const visibleUnits = useMemo(
     () => units.filter((item) => item.baseRent === activeTier),
@@ -1043,10 +1447,6 @@ export default function Home() {
     ledgerSearch.trim() !== "" || ledgerMonth !== "";
 
   const filteredLedger = useMemo(() => {
-    if (!ledgerFilterActive) {
-      return [];
-    }
-
     const query = ledgerSearch.trim().toLowerCase();
     return ledger.filter((entry) => {
       const matchesSearch =
@@ -1057,7 +1457,97 @@ export default function Home() {
         ledgerMonth === "" || paymentMonthKey(entry.datePaid) === ledgerMonth;
       return matchesSearch && matchesMonth;
     });
-  }, [ledger, ledgerFilterActive, ledgerMonth, ledgerSearch]);
+  }, [ledger, ledgerMonth, ledgerSearch]);
+
+  async function writeElectricityRateToUnits(rate: number | null) {
+    if (!supabase) {
+      return;
+    }
+
+    const ids = unitsRef.current.map((unit) => unit.id);
+    if (ids.length === 0) {
+      return;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const updatedBy = user?.email ?? null;
+    lastRateUpdatedAtRef.current = updatedAt;
+
+    const { error } = await supabase
+      .from("Units")
+      .update({
+        electricity_rate: rate,
+        electricity_rate_updated_by: updatedBy,
+        electricity_rate_updated_at: updatedAt,
+      })
+      .in("id", ids);
+
+    if (error) {
+      console.error("Failed to save electricity rate:", error);
+      return;
+    }
+
+    // Local sessions still get the banner if they reopen later; active peers
+    // receive the realtime UPDATE. Show locally for the editor too.
+    applyElectricityRateMeta(
+      {
+        rate,
+        updatedBy,
+        updatedAt,
+      },
+      { showNotice: true },
+    );
+  }
+
+  async function persistElectricityRate(value: string) {
+    setElectricityRateInput(value);
+
+    if (value === "") {
+      clearStoredElectricityRate();
+      await writeElectricityRateToUnits(null);
+      return;
+    }
+
+    const valid = Number.isFinite(Number(value)) && Number(value) > 0;
+    if (!valid) {
+      return;
+    }
+
+    writeStoredElectricityRate(value);
+    await writeElectricityRateToUnits(Number(value));
+  }
+
+  function schedulePersistElectricityRate(value: string) {
+    setElectricityRateInput(value);
+    if (value === "") {
+      clearStoredElectricityRate();
+    } else if (Number.isFinite(Number(value)) && Number(value) > 0) {
+      writeStoredElectricityRate(value);
+    }
+
+    if (persistRateTimerRef.current) {
+      clearTimeout(persistRateTimerRef.current);
+    }
+    persistRateTimerRef.current = setTimeout(() => {
+      void persistElectricityRate(value);
+    }, 450);
+  }
+
+  async function clearElectricityRateEverywhere() {
+    setElectricityRateInput("");
+    clearStoredElectricityRate();
+    await writeElectricityRateToUnits(null);
+  }
+
+  function changeBillingPeriod(item: DashboardUnit, next: string) {
+    if (!isAdmin) {
+      return;
+    }
+    patchUnit(item.id, {
+      billingPeriod: next,
+      message: null,
+    });
+  }
 
   async function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1271,33 +1761,94 @@ export default function Home() {
   }
 
   async function startNewMonth() {
-    if (!isAdmin) {
+    if (!isAdmin || startingNewMonth) {
       return;
     }
 
     const confirmed = window.confirm(
-      "Start a new month? Current readings will move to previous readings, current readings will be cleared, and every unit payment status will reset to Unpaid.",
+      "Start a new month? Current readings will move to previous readings, current readings will be cleared, payment drafts will reset, and the electricity rate will be cleared.",
     );
     if (!confirmed) {
       return;
     }
 
-    setUnits((current) =>
-      current.map((unit) => ({
-        ...unit,
-        previousReading: unit.currentReading,
-        currentReading: "",
-        paymentDate: "",
-        billingPeriod: "",
-        rentPaid: "",
-        electricityPaid: "",
-        amountPaid: "",
-        paymentStatus: "Unpaid",
-        paymentId: null,
-        receiptUrl: null,
-        message: null,
-      })),
-    );
+    setStartingNewMonth(true);
+
+    try {
+      const before = unitsRef.current;
+      const samplePeriod =
+        before.find((unit) => unit.billingPeriod.trim())?.billingPeriod ?? "";
+      const nextPeriod = getNextBillingPeriod(samplePeriod);
+
+      await clearElectricityRateEverywhere();
+
+      const rolled = before.map((unit) => {
+        const currentNum = Number(unit.currentReading);
+        const hasValidCurrent =
+          unit.currentReading.trim() !== "" &&
+          Number.isFinite(currentNum) &&
+          currentNum > 0;
+
+        return {
+          ...unit,
+          previousReading: hasValidCurrent
+            ? String(currentNum)
+            : unit.previousReading,
+          currentReading: "",
+          paymentDate: "",
+          billingPeriod: nextPeriod,
+          rentPaid: "",
+          electricityPaid: "",
+          amountPaid: "",
+          paymentStatus:
+            unit.status === "Occupied" ? ("Unpaid" as const) : unit.paymentStatus,
+          paymentId: null,
+          receiptUrl: null,
+          message: null,
+        };
+      });
+
+      setUnits(rolled);
+      unitsRef.current = rolled;
+
+      if (!supabase) {
+        return;
+      }
+
+      await Promise.all(
+        before.map(async (unit, index) => {
+          const next = rolled[index];
+          const currentNum = Number(unit.currentReading);
+          const hasValidCurrent =
+            unit.currentReading.trim() !== "" &&
+            Number.isFinite(currentNum) &&
+            currentNum > 0;
+
+          const payload: Record<string, unknown> = {
+            current_reading: null,
+            payment_date: null,
+            rent_paid: null,
+            electricity_paid: null,
+            total_paid: null,
+            receipt_url: null,
+            billing_period: nextPeriod,
+          };
+
+          // Roll current → previous only when current is valid; never wipe previous to null.
+          if (hasValidCurrent) {
+            payload.previous_reading = currentNum;
+          }
+
+          if (next.status === "Occupied") {
+            payload.payment_status = "Unpaid";
+          }
+
+          await supabase.from("Units").update(payload).eq("id", unit.id);
+        }),
+      );
+    } finally {
+      setStartingNewMonth(false);
+    }
   }
 
   async function changePaymentStatus(item: DashboardUnit, next: PaymentStatus) {
@@ -1306,6 +1857,13 @@ export default function Home() {
     }
 
     const markingPaid = next === "Paid";
+    if (markingPaid && !hasValidElectricityRate) {
+      patchUnit(item.id, {
+        message: electricityRateRequiredMessage,
+      });
+      return;
+    }
+
     // Unlock audio during the user gesture so iOS/Android allow the success chime.
     if (markingPaid && isMobile) {
       unlockAudio(audioCtxRef);
@@ -1391,37 +1949,53 @@ export default function Home() {
         return;
       }
 
-      const { error: balanceError } = await supabase
+      const unitPaidPatch = {
+        paymentId: String(data.id),
+        paymentStatus: "Paid" as const,
+        balance: nextBalance,
+        paymentDate,
+        billingPeriod: billingPeriod ?? item.billingPeriod,
+        rentPaid: String(rentPaidSnapshot),
+        electricityPaid:
+          electricityChargeSnapshot == null
+            ? item.electricityPaid
+            : String(electricityChargeSnapshot),
+        amountPaid: String(amountPaid),
+      };
+
+      const { error: unitPaidError } = await supabase
         .from("Units")
-        .update({ balance: nextBalance })
+        .update({
+          balance: nextBalance,
+          payment_status: "Paid",
+          payment_date: paymentDate,
+          billing_period: billingPeriod,
+          rent_paid: rentPaidSnapshot,
+          electricity_paid: electricityChargeSnapshot,
+          total_paid: amountPaid,
+          receipt_url: item.receiptUrl,
+        })
         .eq("id", item.id);
 
-      if (balanceError) {
+      if (unitPaidError) {
+        // Payment row already exists; keep local Paid + warn about unit sync.
         patchUnit(item.id, {
-          paymentId: String(data.id),
-          paymentStatus: "Paid",
-          message: balanceError.message,
+          ...unitPaidPatch,
+          message: unitPaidError.message,
         });
-        return;
+      } else {
+        patchUnit(item.id, unitPaidPatch);
       }
 
-      patchUnit(item.id, {
-        paymentId: String(data.id),
-        paymentStatus: "Paid",
-        balance: nextBalance,
-      });
-
-      if (item.paymentStatus === "Unpaid") {
-        const labels = new Map(
-          unitsRef.current.map((unit) => [unit.id, unit.label]),
-        );
-        const [entry] = paymentsToLedger([data], labels);
-        if (entry) {
-          setLedger((current) => [
-            entry,
-            ...current.filter((row) => row.id !== entry.id),
-          ]);
-        }
+      const labels = new Map(
+        unitsRef.current.map((unit) => [unit.id, unit.label]),
+      );
+      const [entry] = paymentsToLedger([data], labels);
+      if (entry) {
+        setLedger((current) => [
+          entry,
+          ...current.filter((row) => row.id !== entry.id),
+        ]);
       }
 
       if (isMobile) {
@@ -1434,6 +2008,21 @@ export default function Home() {
       }
       announceSuccess(`${item.label} Marked as Paid`);
       return;
+    }
+
+    if (supabase) {
+      const { error: unitStatusError } = await supabase
+        .from("Units")
+        .update({ payment_status: next })
+        .eq("id", item.id);
+
+      if (unitStatusError) {
+        patchUnit(item.id, {
+          paymentStatus: item.paymentStatus,
+          message: unitStatusError.message,
+        });
+        return;
+      }
     }
 
     if (supabase && item.paymentId) {
@@ -1476,6 +2065,8 @@ export default function Home() {
       bill.totalAmountDue == null
         ? item.baseRent + item.balance
         : bill.totalAmountDue;
+    const moneyMismatch = ocrMoneyMismatch(item);
+    const readingMismatch = ocrReadingMismatch(item);
 
     return (
       <div
@@ -1485,6 +2076,39 @@ export default function Home() {
             : "flex flex-col gap-4"
         }
       >
+        {item.receiptUrl ? (
+          <ReceiptThumbnail
+            receiptUrl={item.receiptUrl}
+            label={item.label}
+            className={split ? "sm:col-span-2" : undefined}
+            onOpen={() => setReceiptPreview(item.receiptUrl)}
+          />
+        ) : null}
+        {moneyMismatch || readingMismatch ? (
+          <div
+            className={`space-y-2 ${split ? "sm:col-span-2" : ""}`}
+            role="status"
+          >
+            {moneyMismatch ? (
+              <p className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                Amount mismatch: rent paid (
+                {peso(Number(item.rentPaid))}) + electricity paid (
+                {peso(Number(item.electricityPaid))}) does not equal total paid (
+                {peso(Number(item.amountPaid))}). Check the receipt before
+                marking as paid.
+              </p>
+            ) : null}
+            {readingMismatch ? (
+              <p className="rounded-xl border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-900">
+                Reading mismatch: current kWh (
+                {Number(item.currentReading).toLocaleString("en-PH")}) is lower
+                than previous kWh (
+                {Number(item.previousReading).toLocaleString("en-PH")}). Verify
+                the handwritten meter reading.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
         <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
           Previous kWh
           <input
@@ -1547,14 +2171,15 @@ export default function Home() {
           <input
             type="text"
             value={item.billingPeriod}
-            onChange={(event) =>
-              patchUnit(item.id, {
-                billingPeriod: event.target.value,
-                message: null,
-              })
-            }
-            placeholder="October - November 2026"
-            className={fieldClass}
+            readOnly={!isAdmin}
+            disabled={!isAdmin}
+            onChange={(event) => {
+              changeBillingPeriod(item, event.target.value);
+            }}
+            placeholder={billingPeriodPlaceholder}
+            className={`${fieldClass}${
+              isAdmin ? "" : " cursor-not-allowed bg-slate-50 text-slate-600"
+            }`}
           />
         </label>
         <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
@@ -1630,24 +2255,6 @@ export default function Home() {
             ))}
           </select>
         </label>
-        {item.receiptUrl ? (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              setReceiptPreview(item.receiptUrl);
-            }}
-            className={`overflow-hidden rounded-xl ring-1 ring-slate-200 ${
-              split ? "sm:col-span-2" : ""
-            }`}
-          >
-            <img
-              src={item.receiptUrl}
-              alt={`Receipt for ${item.label}`}
-              className="h-28 w-full object-cover"
-            />
-          </button>
-        ) : null}
         <dl
           className={`grid grid-cols-1 gap-2 rounded-xl bg-slate-50 p-3 text-sm ${
             split ? "sm:col-span-2 sm:grid-cols-2" : ""
@@ -1702,16 +2309,24 @@ export default function Home() {
           Payment status
           <select
             value={item.paymentStatus}
-            onChange={(event) =>
-              void changePaymentStatus(
-                item,
-                event.target.value as PaymentStatus,
-              )
-            }
+            onChange={(event) => {
+              const next = event.target.value as PaymentStatus;
+              if (next === "Paid" && !hasValidElectricityRate) {
+                patchUnit(item.id, {
+                  message: electricityRateRequiredMessage,
+                });
+                return;
+              }
+              void changePaymentStatus(item, next);
+            }}
             className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
           >
             {PAYMENT_STATUSES.map((status) => (
-              <option key={status} value={status}>
+              <option
+                key={status}
+                value={status}
+                disabled={status === "Paid" && !hasValidElectricityRate}
+              >
                 {status}
               </option>
             ))}
@@ -1752,9 +2367,13 @@ export default function Home() {
             <>
               <motion.button
                 type="button"
-                disabled={item.paymentStatus === "Paid"}
+                disabled={
+                  item.paymentStatus === "Paid" || !hasValidElectricityRate
+                }
                 whileTap={
-                  item.paymentStatus === "Paid" ? undefined : { scale: 0.98 }
+                  item.paymentStatus === "Paid" || !hasValidElectricityRate
+                    ? undefined
+                    : { scale: 0.98 }
                 }
                 onClick={(event) => {
                   event.stopPropagation();
@@ -1781,7 +2400,9 @@ export default function Home() {
             <>
               <button
                 type="button"
-                disabled={item.paymentStatus === "Paid"}
+                disabled={
+                  item.paymentStatus === "Paid" || !hasValidElectricityRate
+                }
                 onClick={(event) => {
                   event.stopPropagation();
                   void changePaymentStatus(item, "Paid");
@@ -1803,6 +2424,13 @@ export default function Home() {
             </>
           )}
         </div>
+        {!hasValidElectricityRate ? (
+          <p
+            className={`text-sm text-amber-700 ${split ? "sm:col-span-2" : ""}`}
+          >
+            {electricityRateRequiredMessage}
+          </p>
+        ) : null}
         {item.message ? (
           <p
             className={`text-sm text-rose-700 ${split ? "sm:col-span-2" : ""}`}
@@ -1884,7 +2512,9 @@ export default function Home() {
           unit.id === matched.id
             ? {
                 ...unit,
-                ...unitPatchFromExtraction(extraction, null),
+                ...unitPatchFromExtraction(extraction, null, {
+                  allowBillingPeriod: isAdmin,
+                }),
                 message: uploadMessage,
               }
             : unit,
@@ -1905,7 +2535,10 @@ export default function Home() {
       };
     }
 
-    const unitPatch = unitPatchFromExtraction(extraction, receiptUrl);
+    // Draft only: populate editable card fields. Never auto Mark as Paid.
+    const unitPatch = unitPatchFromExtraction(extraction, receiptUrl, {
+      allowBillingPeriod: isAdmin,
+    });
     setUnits((prev) => {
       const next = prev.map((unit) =>
         unit.id === matched.id ? { ...unit, ...unitPatch } : unit,
@@ -2162,36 +2795,50 @@ export default function Home() {
           </div>
         </header>
 
+        {electricityRateNotice ? (
+          <div
+            role="status"
+            className="flex flex-col gap-3 rounded-2xl bg-amber-50 px-4 py-3 text-amber-950 ring-1 ring-amber-200 sm:flex-row sm:items-center sm:justify-between"
+          >
+            <p className="text-sm font-medium sm:text-[0.95rem]">
+              {electricityRateNotice.rate == null
+                ? `Electricity rate cleared by ${electricityRateNotice.updatedBy} at ${formatRateNoticeTime(electricityRateNotice.updatedAt)}`
+                : `Electricity rate updated to ₱${Number(
+                    electricityRateNotice.rate,
+                  ).toLocaleString("en-PH", {
+                    minimumFractionDigits: 0,
+                    maximumFractionDigits: 4,
+                  })}/kWh by ${electricityRateNotice.updatedBy} at ${formatRateNoticeTime(electricityRateNotice.updatedAt)}`}
+            </p>
+            <button
+              type="button"
+              onClick={dismissElectricityRateNotice}
+              className="shrink-0 rounded-xl bg-amber-900 px-3 py-2 text-sm font-semibold text-white"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+
         <section
           aria-label="Global controls"
           className="flex flex-col gap-3 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:flex-row sm:items-center sm:justify-between"
         >
-          {isAdmin ? (
-            <label className="flex w-full flex-col gap-1.5 text-sm font-medium text-slate-700 sm:flex-1">
-              Electricity Rate (₱ / kWh)
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                inputMode="decimal"
-                value={electricityRateInput}
-                onChange={(event) => setElectricityRateInput(event.target.value)}
-                placeholder="0.00"
-                className={`${fieldClass} sm:max-w-xs`}
-              />
-            </label>
-          ) : (
-            <div className="flex w-full flex-col gap-1.5 text-sm text-slate-500 sm:flex-1">
-              <span className="font-medium text-slate-700">
-                Electricity Rate (₱ / kWh)
-              </span>
-              <span>
-                {electricityRate === null
-                  ? "Set by Admin"
-                  : `₱${Number(electricityRate).toLocaleString("en-PH")} / kWh`}
-              </span>
-            </div>
-          )}
+          <label className="flex w-full flex-col gap-1.5 text-sm font-medium text-slate-700 sm:flex-1">
+            Electricity Rate (₱ / kWh)
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              inputMode="decimal"
+              value={electricityRateInput}
+              onChange={(event) => {
+                schedulePersistElectricityRate(event.target.value);
+              }}
+              placeholder="0.00"
+              className={`${fieldClass} sm:max-w-xs`}
+            />
+          </label>
           <div className="flex flex-col gap-2 sm:flex-1 sm:flex-row sm:items-center sm:justify-center">
             <label
               className={`${primaryButtonClass} cursor-pointer ${
@@ -2223,10 +2870,13 @@ export default function Home() {
             {isAdmin ? (
               <button
                 type="button"
+                disabled={startingNewMonth}
                 onClick={() => void startNewMonth()}
-                className={primaryButtonClass}
+                className={`${primaryButtonClass} ${
+                  startingNewMonth ? "pointer-events-none opacity-60" : ""
+                }`}
               >
-                Start New Month
+                {startingNewMonth ? "Starting…" : "Start New Month"}
               </button>
             ) : null}
           </div>
@@ -2674,7 +3324,8 @@ export default function Home() {
               Payment Ledger
             </h2>
             <p className="mt-1 text-sm text-slate-500">
-              Look up payment history by unit name, who received it, or month.
+              All payments are listed below. Use search or month to narrow the
+              list.
             </p>
           </div>
 
@@ -2696,7 +3347,7 @@ export default function Home() {
                 onChange={(event) => setLedgerMonth(event.target.value)}
                 className={fieldClass}
               >
-                <option value="">Select month</option>
+                <option value="">All Months</option>
                 {ledgerMonthOptions.map((monthKey) => (
                   <option key={monthKey} value={monthKey}>
                     {formatMonthOption(monthKey)}
@@ -2721,9 +3372,9 @@ export default function Home() {
             )}
           </div>
 
-          {!ledgerFilterActive ? (
+          {ledger.length === 0 ? (
             <p className="mt-5 rounded-xl bg-slate-50 px-4 py-6 text-sm text-slate-500">
-              Search a unit (e.g., 1N) or select a month to view payment history.
+              No payments recorded yet.
             </p>
           ) : filteredLedger.length === 0 ? (
             <p className="mt-5 rounded-xl bg-slate-50 px-4 py-6 text-sm text-slate-500">
@@ -3072,14 +3723,22 @@ export default function Home() {
       ) : null}
       {receiptPreview ? (
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/80 p-5"
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/90 p-3 sm:p-5"
           onClick={() => setReceiptPreview(null)}
         >
-          <img
-            src={receiptPreview}
-            alt="Receipt"
-            className="max-h-full max-w-full rounded-lg object-contain"
-          />
+          <div
+            className="max-h-full max-w-full overflow-auto overscroll-contain"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <img
+              src={receiptPreview}
+              alt="Receipt"
+              className="mx-auto block h-auto w-auto max-w-[min(100vw-1.5rem,56rem)] origin-center touch-manipulation rounded-lg object-contain"
+            />
+            <p className="mt-3 text-center text-sm text-slate-300">
+              Pinch to zoom · tap outside to close
+            </p>
+          </div>
         </div>
       ) : null}
       <AnimatePresence>
