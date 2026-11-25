@@ -1145,7 +1145,14 @@ export default function Home() {
   const electricityRate = hasValidElectricityRate ? electricityRateInput : null;
   const electricityRateRequiredMessage =
     "Enter an Electricity Rate (₱ / kWh) at the top before marking as paid.";
-  const billingPeriodPlaceholder = getNextBillingPeriod("");
+  const [billingPeriodPlaceholder, setBillingPeriodPlaceholder] = useState(
+    "Month - Month YYYY",
+  );
+
+  useEffect(() => {
+    // Defer Date.now() so prerender does not capture a blocking current-time read.
+    setBillingPeriodPlaceholder(getNextBillingPeriod(""));
+  }, []);
 
   function applyElectricityRateMeta(
     meta: ElectricityRateMeta,
