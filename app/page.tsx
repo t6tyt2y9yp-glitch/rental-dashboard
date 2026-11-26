@@ -205,23 +205,7 @@ function moneyToInput(value: unknown) {
   return readingToInput(value);
 }
 
-function getNextBillingPeriod(currentPeriod: string) {
-  const trimmed = currentPeriod.trim();
-  const match = /^([A-Za-z]+)\s*-\s*([A-Za-z]+)\s+(\d{4})$/.exec(trimmed);
-  if (match) {
-    const endName = match[2];
-    const year = Number(match[3]);
-    const endIndex = MONTH_NAMES.findIndex(
-      (month) => month.toLowerCase() === endName.toLowerCase(),
-    );
-    if (endIndex >= 0 && Number.isFinite(year)) {
-      const startIndex = endIndex;
-      const nextEndIndex = (endIndex + 1) % 12;
-      const endYear = endIndex === 11 ? year + 1 : year;
-      return `${MONTH_NAMES[startIndex]} - ${MONTH_NAMES[nextEndIndex]} ${endYear}`;
-    }
-  }
-
+function defaultBillingPeriodFromToday() {
   const now = new Date();
   const startIndex = now.getMonth();
   const nextEndIndex = (startIndex + 1) % 12;
@@ -229,6 +213,64 @@ function getNextBillingPeriod(currentPeriod: string) {
     startIndex === 11 ? now.getFullYear() + 1 : now.getFullYear();
   return `${MONTH_NAMES[startIndex]} - ${MONTH_NAMES[nextEndIndex]} ${endYear}`;
 }
+
+function shiftBillingPeriod(currentPeriod: string, delta: number) {
+  let period = currentPeriod.trim() || defaultBillingPeriodFromToday();
+  if (delta === 0) {
+    return period;
+  }
+
+  const step = delta > 0 ? 1 : -1;
+  const count = Math.abs(delta);
+
+  for (let index = 0; index < count; index += 1) {
+    const match = /^([A-Za-z]+)\s*-\s*([A-Za-z]+)\s+(\d{4})$/.exec(period);
+    if (!match) {
+      period = defaultBillingPeriodFromToday();
+      continue;
+    }
+
+    const startIndex = MONTH_NAMES.findIndex(
+      (month) => month.toLowerCase() === match[1].toLowerCase(),
+    );
+    const endIndex = MONTH_NAMES.findIndex(
+      (month) => month.toLowerCase() === match[2].toLowerCase(),
+    );
+    const endYear = Number(match[3]);
+    if (startIndex < 0 || endIndex < 0 || !Number.isFinite(endYear)) {
+      period = defaultBillingPeriodFromToday();
+      continue;
+    }
+
+    if (step > 0) {
+      const nextStart = endIndex;
+      const nextEnd = (endIndex + 1) % 12;
+      const nextYear = endIndex === 11 ? endYear + 1 : endYear;
+      period = `${MONTH_NAMES[nextStart]} - ${MONTH_NAMES[nextEnd]} ${nextYear}`;
+    } else {
+      const prevEnd = startIndex;
+      const prevStart = (startIndex - 1 + 12) % 12;
+      const startYear = startIndex > endIndex ? endYear - 1 : endYear;
+      period = `${MONTH_NAMES[prevStart]} - ${MONTH_NAMES[prevEnd]} ${startYear}`;
+    }
+  }
+
+  return period;
+}
+
+function getNextBillingPeriod(currentPeriod: string) {
+  const trimmed = currentPeriod.trim();
+  if (!trimmed) {
+    return defaultBillingPeriodFromToday();
+  }
+  return shiftBillingPeriod(trimmed, 1);
+}
+
+type PendingPeriodChange = {
+  direction: "next" | "prev";
+  from: string;
+  to: string;
+};
 
 function readStoredElectricityRate() {
   try {
@@ -447,6 +489,111 @@ function playApplePayChime(audioCtxRef: AudioContextRef) {
     // Note 2: E6 + 2nd harmonic
     scheduleBellPartial(ctx, master, 1318.51, t0 + 0.11, 1, 0.55);
     scheduleBellPartial(ctx, master, 2637.02, t0 + 0.11, 0.2, 0.55);
+  } catch {
+    // Silent fallback if audio is blocked or unavailable.
+  }
+}
+
+const appleErrorSfxCooldownRef = { current: 0 };
+const APPLE_ERROR_SFX_COOLDOWN_MS = 500;
+
+function scheduleErrorThud(
+  ctx: AudioContext,
+  destination: AudioNode,
+  options: {
+    startAt: number;
+    triHz: number;
+    sawHz: number;
+    lowpassHz: number;
+    duration: number;
+  },
+) {
+  const { startAt, triHz, sawHz, lowpassHz, duration } = options;
+
+  const filter = ctx.createBiquadFilter();
+  filter.type = "lowpass";
+  filter.frequency.setValueAtTime(lowpassHz, startAt);
+  filter.Q.setValueAtTime(0.7, startAt);
+  filter.connect(destination);
+
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0.0001, startAt);
+  gain.gain.exponentialRampToValueAtTime(1, startAt + 0.005);
+  gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
+  gain.connect(filter);
+
+  const triangle = ctx.createOscillator();
+  triangle.type = "triangle";
+  triangle.frequency.setValueAtTime(triHz, startAt);
+  triangle.connect(gain);
+
+  const saw = ctx.createOscillator();
+  saw.type = "sawtooth";
+  saw.frequency.setValueAtTime(sawHz, startAt);
+  const sawGain = ctx.createGain();
+  sawGain.gain.setValueAtTime(0.32, startAt);
+  saw.connect(sawGain);
+  sawGain.connect(gain);
+
+  triangle.start(startAt);
+  saw.start(startAt);
+  triangle.stop(startAt + duration + 0.05);
+  saw.stop(startAt + duration + 0.05);
+}
+
+function playAppleErrorSfx(audioCtxRef: AudioContextRef) {
+  try {
+    const now =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (now - appleErrorSfxCooldownRef.current < APPLE_ERROR_SFX_COOLDOWN_MS) {
+      return;
+    }
+    appleErrorSfxCooldownRef.current = now;
+
+    unlockAudio(audioCtxRef);
+    const ctx = audioCtxRef.current;
+    if (!ctx) {
+      return;
+    }
+    if (ctx.state === "suspended") {
+      void ctx.resume();
+    }
+
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.setValueAtTime(-18, ctx.currentTime);
+    compressor.knee.setValueAtTime(12, ctx.currentTime);
+    compressor.ratio.setValueAtTime(8, ctx.currentTime);
+    compressor.attack.setValueAtTime(0.003, ctx.currentTime);
+    compressor.release.setValueAtTime(0.12, ctx.currentTime);
+    compressor.connect(ctx.destination);
+
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0.75, ctx.currentTime);
+    master.connect(compressor);
+
+    const t0 = ctx.currentTime;
+    // Thud 1
+    scheduleErrorThud(ctx, master, {
+      startAt: t0,
+      triHz: 210,
+      sawHz: 105,
+      lowpassHz: 700,
+      duration: 0.14,
+    });
+    // Thud 2
+    scheduleErrorThud(ctx, master, {
+      startAt: t0 + 0.14,
+      triHz: 155,
+      sawHz: 77.5,
+      lowpassHz: 600,
+      duration: 0.24,
+    });
+
+    try {
+      navigator.vibrate?.([100, 50, 160]);
+    } catch {
+      // Haptics are best-effort only.
+    }
   } catch {
     // Silent fallback if audio is blocked or unavailable.
   }
@@ -1389,6 +1536,10 @@ export default function Home() {
   const [electricityRateNotice, setElectricityRateNotice] =
     useState<ElectricityRateNotice | null>(null);
   const [startingNewMonth, setStartingNewMonth] = useState(false);
+  const [pendingPeriodChange, setPendingPeriodChange] =
+    useState<PendingPeriodChange | null>(null);
+  const [periodResetChecked, setPeriodResetChecked] = useState(true);
+  const [confirmingPeriodChange, setConfirmingPeriodChange] = useState(false);
   const lastRateUpdatedAtRef = useRef<string | null>(null);
   const persistRateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -1725,6 +1876,10 @@ export default function Home() {
     setReceiptNotice(message);
   }
 
+  function announceWarning() {
+    playAppleErrorSfx(audioCtxRef);
+  }
+
   const ledgerMonthOptions = useMemo(() => {
     const months = new Set<string>();
     for (const entry of ledger) {
@@ -1860,6 +2015,7 @@ export default function Home() {
     setSigningIn(false);
 
     if (error) {
+      announceWarning();
       setLoginError(error.message);
       return;
     }
@@ -1916,6 +2072,7 @@ export default function Home() {
     setSavingExpense(false);
 
     if (error) {
+      announceWarning();
       setExpensesError(error.message);
       return;
     }
@@ -2053,94 +2210,153 @@ export default function Home() {
     });
   }
 
-  async function startNewMonth() {
-    if (!isAdmin || startingNewMonth) {
+  const activeBillingPeriod = useMemo(() => {
+    const fromUnits = units.find((unit) => unit.billingPeriod.trim())
+      ?.billingPeriod;
+    return fromUnits?.trim() || billingPeriodPlaceholder;
+  }, [billingPeriodPlaceholder, units]);
+
+  function requestBillingPeriodStep(direction: "next" | "prev") {
+    if (!isAdmin || startingNewMonth || confirmingPeriodChange) {
       return;
     }
 
-    const confirmed = window.confirm(
-      "Start a new month? Current readings will move to previous readings, current readings will be cleared, payment drafts will reset, and the electricity rate will be cleared.",
-    );
-    if (!confirmed) {
+    const from = activeBillingPeriod;
+    const to = shiftBillingPeriod(from, direction === "next" ? 1 : -1);
+    if (to === from) {
       return;
     }
 
-    setStartingNewMonth(true);
+    unlockAudio(audioCtxRef);
+    playAppleErrorSfx(audioCtxRef);
+    setPeriodResetChecked(direction === "next");
+    setPendingPeriodChange({ direction, from, to });
+  }
 
-    try {
-      const before = unitsRef.current;
-      const samplePeriod =
-        before.find((unit) => unit.billingPeriod.trim())?.billingPeriod ?? "";
-      const nextPeriod = getNextBillingPeriod(samplePeriod);
+  async function applyBillingPeriodLabelOnly(nextPeriod: string) {
+    const updated = unitsRef.current.map((unit) => ({
+      ...unit,
+      billingPeriod: nextPeriod,
+      message: null,
+    }));
+    setUnits(updated);
+    unitsRef.current = updated;
+    setBillingPeriodPlaceholder(nextPeriod);
 
-      await clearElectricityRateEverywhere();
+    if (!supabase) {
+      return;
+    }
 
-      const rolled = before.map((unit) => {
+    const ids = updated.map((unit) => unit.id);
+    if (ids.length === 0) {
+      return;
+    }
+
+    const { error } = await supabase
+      .from("Units")
+      .update({ billing_period: nextPeriod })
+      .in("id", ids);
+
+    if (error) {
+      announceWarning();
+      window.alert(formatAlert(error.message));
+    }
+  }
+
+  async function applyBillingPeriodRollover(nextPeriod: string) {
+    const before = unitsRef.current;
+    await clearElectricityRateEverywhere();
+
+    const rolled = before.map((unit) => {
+      const currentNum = Number(unit.currentReading);
+      const hasValidCurrent =
+        unit.currentReading.trim() !== "" &&
+        Number.isFinite(currentNum) &&
+        currentNum > 0;
+
+      return {
+        ...unit,
+        previousReading: hasValidCurrent
+          ? String(currentNum)
+          : unit.previousReading,
+        currentReading: "",
+        paymentDate: "",
+        billingPeriod: nextPeriod,
+        scannedBillingPeriod: null,
+        rentPaid: "",
+        electricityPaid: "",
+        amountPaid: "",
+        paymentStatus:
+          unit.status === "Occupied" ? ("Unpaid" as const) : unit.paymentStatus,
+        paymentId: null,
+        receiptUrl: null,
+        message: null,
+      };
+    });
+
+    setUnits(rolled);
+    unitsRef.current = rolled;
+    setBillingPeriodPlaceholder(nextPeriod);
+
+    if (!supabase) {
+      return;
+    }
+
+    await Promise.all(
+      before.map(async (unit, index) => {
+        const next = rolled[index];
         const currentNum = Number(unit.currentReading);
         const hasValidCurrent =
           unit.currentReading.trim() !== "" &&
           Number.isFinite(currentNum) &&
           currentNum > 0;
 
-        return {
-          ...unit,
-          previousReading: hasValidCurrent
-            ? String(currentNum)
-            : unit.previousReading,
-          currentReading: "",
-          paymentDate: "",
-          billingPeriod: nextPeriod,
-          scannedBillingPeriod: null,
-          rentPaid: "",
-          electricityPaid: "",
-          amountPaid: "",
-          paymentStatus:
-            unit.status === "Occupied" ? ("Unpaid" as const) : unit.paymentStatus,
-          paymentId: null,
-          receiptUrl: null,
-          message: null,
+        const payload: Record<string, unknown> = {
+          current_reading: null,
+          payment_date: null,
+          rent_paid: null,
+          electricity_paid: null,
+          total_paid: null,
+          receipt_url: null,
+          billing_period: nextPeriod,
         };
-      });
 
-      setUnits(rolled);
-      unitsRef.current = rolled;
+        if (hasValidCurrent) {
+          payload.previous_reading = currentNum;
+        }
 
-      if (!supabase) {
-        return;
+        if (next.status === "Occupied") {
+          payload.payment_status = "Unpaid";
+        }
+
+        await supabase.from("Units").update(payload).eq("id", unit.id);
+      }),
+    );
+  }
+
+  async function confirmBillingPeriodChange() {
+    if (!isAdmin) {
+      return;
+    }
+    if (!pendingPeriodChange || confirmingPeriodChange || startingNewMonth) {
+      return;
+    }
+
+    const pending = pendingPeriodChange;
+    const shouldRollover =
+      pending.direction === "next" && periodResetChecked;
+
+    setConfirmingPeriodChange(true);
+    setStartingNewMonth(true);
+    try {
+      if (shouldRollover) {
+        await applyBillingPeriodRollover(pending.to);
+      } else {
+        await applyBillingPeriodLabelOnly(pending.to);
       }
-
-      await Promise.all(
-        before.map(async (unit, index) => {
-          const next = rolled[index];
-          const currentNum = Number(unit.currentReading);
-          const hasValidCurrent =
-            unit.currentReading.trim() !== "" &&
-            Number.isFinite(currentNum) &&
-            currentNum > 0;
-
-          const payload: Record<string, unknown> = {
-            current_reading: null,
-            payment_date: null,
-            rent_paid: null,
-            electricity_paid: null,
-            total_paid: null,
-            receipt_url: null,
-            billing_period: nextPeriod,
-          };
-
-          // Roll current → previous only when current is valid; never wipe previous to null.
-          if (hasValidCurrent) {
-            payload.previous_reading = currentNum;
-          }
-
-          if (next.status === "Occupied") {
-            payload.payment_status = "Unpaid";
-          }
-
-          await supabase.from("Units").update(payload).eq("id", unit.id);
-        }),
-      );
+      setPendingPeriodChange(null);
     } finally {
+      setConfirmingPeriodChange(false);
       setStartingNewMonth(false);
     }
   }
@@ -2165,11 +2381,14 @@ export default function Home() {
   }
 
   function requestMarkAsPaid(item: DashboardUnit) {
+    unlockAudio(audioCtxRef);
+
     if (item.paymentStatus === "Paid") {
       return;
     }
 
     if (!isAdmin && !hasScannedReceipt(item)) {
+      announceWarning();
       patchUnit(item.id, {
         message: STAFF_RECEIPT_REQUIRED_HINT,
       });
@@ -2177,6 +2396,7 @@ export default function Home() {
     }
 
     if (!isAdmin && hasBillingPeriodMismatch(item)) {
+      announceWarning();
       patchUnit(item.id, {
         message: billingPeriodMismatchMessage(item),
       });
@@ -2184,6 +2404,7 @@ export default function Home() {
     }
 
     if (!hasValidElectricityRate) {
+      announceWarning();
       patchUnit(item.id, {
         message: electricityRateRequiredMessage,
       });
@@ -2192,6 +2413,7 @@ export default function Home() {
 
     const blockers = getStaffMarkPaidBlockers(item);
     if (blockers.length > 0) {
+      announceWarning();
       patchUnit(item.id, {
         message: staffMarkPaidHint(blockers),
       });
@@ -2204,6 +2426,7 @@ export default function Home() {
     }
 
     if (hasBillingPeriodMismatch(item)) {
+      announceWarning();
       const confirmed = window.confirm(
         `${formatAlert(billingPeriodMismatchMessage(item))}\n\nLog this payment anyway?`,
       );
@@ -2212,10 +2435,6 @@ export default function Home() {
       }
     }
 
-    // Admin: instant save (unlock on mobile for the chime).
-    if (isMobile) {
-      unlockAudio(audioCtxRef);
-    }
     void changePaymentStatus(item, "Paid");
   }
 
@@ -2231,6 +2450,7 @@ export default function Home() {
     }
 
     if (!canSubmitMarkAsPaid(item)) {
+      announceWarning();
       const blockers = getStaffMarkPaidBlockers(item);
       patchUnit(item.id, {
         message:
@@ -2267,6 +2487,7 @@ export default function Home() {
 
     const markingPaid = next === "Paid";
     if (markingPaid && !isAdmin && !hasScannedReceipt(item)) {
+      announceWarning();
       patchUnit(item.id, {
         message: STAFF_RECEIPT_REQUIRED_HINT,
       });
@@ -2274,6 +2495,7 @@ export default function Home() {
     }
 
     if (markingPaid && !isAdmin && hasBillingPeriodMismatch(item)) {
+      announceWarning();
       patchUnit(item.id, {
         message: billingPeriodMismatchMessage(item),
       });
@@ -2281,6 +2503,7 @@ export default function Home() {
     }
 
     if (markingPaid && !hasValidElectricityRate) {
+      announceWarning();
       patchUnit(item.id, {
         message: electricityRateRequiredMessage,
       });
@@ -2290,6 +2513,7 @@ export default function Home() {
     if (markingPaid) {
       const blockers = getStaffMarkPaidBlockers(item);
       if (blockers.length > 0) {
+        announceWarning();
         patchUnit(item.id, {
           message: staffMarkPaidHint(blockers),
         });
@@ -2352,6 +2576,7 @@ export default function Home() {
 
     if (markingPaid) {
       if (!supabase) {
+        announceWarning();
         patchUnit(item.id, {
           paymentStatus: item.paymentStatus,
           message: "Supabase is not configured.",
@@ -2382,6 +2607,7 @@ export default function Home() {
         .single();
 
       if (error) {
+        announceWarning();
         patchUnit(item.id, {
           paymentStatus: item.paymentStatus,
           message: error.message,
@@ -2404,6 +2630,7 @@ export default function Home() {
         .eq("id", item.id);
 
       if (unitPaidError) {
+        announceWarning();
         patchUnit(item.id, {
           paymentStatus: item.paymentStatus,
           message: unitPaidError.message,
@@ -2456,6 +2683,7 @@ export default function Home() {
         .eq("id", item.id);
 
       if (unitStatusError) {
+        announceWarning();
         patchUnit(item.id, {
           paymentStatus: item.paymentStatus,
           message: unitStatusError.message,
@@ -2471,6 +2699,7 @@ export default function Home() {
         .eq("id", item.paymentId);
 
       if (error) {
+        announceWarning();
         patchUnit(item.id, {
           paymentStatus: item.paymentStatus,
           message: error.message,
@@ -2839,23 +3068,30 @@ export default function Home() {
               >
                 {isMobile ? (
                   <>
-                    <motion.button
-                      type="button"
-                      disabled={cannotMarkPaid}
-                      whileTap={
-                        cannotMarkPaid ? undefined : { scale: 0.98 }
-                      }
+                    <span
+                      className="inline-flex w-full sm:w-auto"
                       onClick={(event) => {
                         event.stopPropagation();
-                        if (!canSubmitMarkAsPaid(item)) {
+                        unlockAudio(audioCtxRef);
+                        if (cannotMarkPaid && item.paymentStatus !== "Paid") {
+                          announceWarning();
                           return;
                         }
                         requestMarkAsPaid(item);
                       }}
-                      className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
                     >
-                      Mark as Paid
-                    </motion.button>
+                      <motion.button
+                        type="button"
+                        disabled={cannotMarkPaid}
+                        tabIndex={cannotMarkPaid ? -1 : undefined}
+                        whileTap={
+                          cannotMarkPaid ? undefined : { scale: 0.98 }
+                        }
+                        className={`${primaryButtonClass} pointer-events-none disabled:cursor-not-allowed disabled:bg-slate-400`}
+                      >
+                        Mark as Paid
+                      </motion.button>
+                    </span>
                     <motion.button
                       type="button"
                       whileTap={{ scale: 0.98 }}
@@ -2870,20 +3106,27 @@ export default function Home() {
                   </>
                 ) : (
                   <>
-                    <button
-                      type="button"
-                      disabled={cannotMarkPaid}
+                    <span
+                      className="inline-flex w-full sm:w-auto"
                       onClick={(event) => {
                         event.stopPropagation();
-                        if (!canSubmitMarkAsPaid(item)) {
+                        unlockAudio(audioCtxRef);
+                        if (cannotMarkPaid && item.paymentStatus !== "Paid") {
+                          announceWarning();
                           return;
                         }
                         requestMarkAsPaid(item);
                       }}
-                      className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
                     >
-                      Mark as Paid
-                    </button>
+                      <button
+                        type="button"
+                        disabled={cannotMarkPaid}
+                        tabIndex={cannotMarkPaid ? -1 : undefined}
+                        className={`${primaryButtonClass} pointer-events-none disabled:cursor-not-allowed disabled:bg-slate-400`}
+                      >
+                        Mark as Paid
+                      </button>
+                    </span>
                     <button
                       type="button"
                       onClick={(event) => {
@@ -3095,6 +3338,7 @@ export default function Home() {
     setScanningReceipt(false);
 
     if (matchedUnits.length === 0 && failedItems.length > 0) {
+      announceWarning();
       setReceiptNoticeIsError(true);
       setReceiptNotice(
         `Batch finished with ${failedItems.length} issue${failedItems.length === 1 ? "" : "s"} and no matched units.`,
@@ -3106,10 +3350,24 @@ export default function Home() {
           : `Scan Complete — ${matchedUnits.length} matched, ${failedItems.length} need attention`;
       announceSuccess(summary);
       if (failedItems.length > 0) {
+        announceWarning();
         setReceiptNoticeIsError(false);
         setReceiptNotice(
           `Batch finished: ${matchedUnits.length} matched, ${failedItems.length} need attention.`,
         );
+      }
+      // Warn if any matched unit still has receipt validation issues.
+      const hasScanWarning = matchedUnits.some((matched) => {
+        const unit = unitsRef.current.find((row) => row.id === matched.unitId);
+        return (
+          unit != null &&
+          (hasBillingPeriodMismatch(unit) ||
+            ocrMoneyMismatch(unit) ||
+            ocrReadingMismatch(unit))
+        );
+      });
+      if (hasScanWarning) {
+        announceWarning();
       }
     } else {
       setReceiptNoticeIsError(false);
@@ -3231,6 +3489,7 @@ export default function Home() {
     setSavingPaymentEdit(false);
 
     if (error) {
+      announceWarning();
       setPaymentEditError(error.message);
       return;
     }
@@ -3266,6 +3525,7 @@ export default function Home() {
 
     if (fetchError) {
       setDeletingPaymentId(null);
+      announceWarning();
       window.alert(formatAlert(fetchError.message));
       return;
     }
@@ -3288,6 +3548,7 @@ export default function Home() {
 
     if (error) {
       setDeletingPaymentId(null);
+      announceWarning();
       window.alert(formatAlert(error.message));
       return;
     }
@@ -3305,6 +3566,7 @@ export default function Home() {
 
       if (remainingError) {
         setDeletingPaymentId(null);
+        announceWarning();
         window.alert(formatAlert(remainingError.message));
         return;
       }
@@ -3342,6 +3604,7 @@ export default function Home() {
 
         if (unitError) {
           setDeletingPaymentId(null);
+          announceWarning();
           window.alert(formatAlert(unitError.message));
           return;
         }
@@ -3405,6 +3668,7 @@ export default function Home() {
     }
 
     if (error) {
+      announceWarning();
       setHistoryError(error.message);
       setPaymentHistory([]);
       setHistoryLoading(false);
@@ -3576,7 +3840,9 @@ export default function Home() {
                 multiple
                 disabled={scanningReceipt}
                 className="sr-only"
+                onClick={() => unlockAudio(audioCtxRef)}
                 onChange={(event) => {
+                  unlockAudio(audioCtxRef);
                   const selected = event.target.files
                     ? Array.from(event.target.files)
                     : [];
@@ -3588,17 +3854,71 @@ export default function Home() {
               />
             </label>
             {isAdmin ? (
-              <button
-                type="button"
-                disabled={startingNewMonth}
-                onClick={() => void startNewMonth()}
-                className={`${primaryButtonClass} ${
-                  startingNewMonth ? "pointer-events-none opacity-60" : ""
-                }`}
+              <div
+                aria-label="Billing period"
+                className="inline-flex min-h-12 w-full items-center justify-between gap-1 rounded-lg border border-slate-300 bg-white px-1 py-1 sm:w-auto"
               >
-                {startingNewMonth ? "Starting…" : "Start New Month"}
-              </button>
-            ) : null}
+                <button
+                  type="button"
+                  aria-label="Previous billing period"
+                  disabled={
+                    startingNewMonth ||
+                    confirmingPeriodChange ||
+                    pendingPeriodChange !== null
+                  }
+                  onClick={() => requestBillingPeriodStep("prev")}
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-md text-slate-800 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 20 20"
+                    className="h-4 w-4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <path
+                      d="M12.5 5 7.5 10l5 5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
+                <span className="min-w-0 flex-1 truncate px-2 text-center text-sm font-semibold text-slate-900">
+                  {activeBillingPeriod}
+                </span>
+                <button
+                  type="button"
+                  aria-label="Next billing period"
+                  disabled={
+                    startingNewMonth ||
+                    confirmingPeriodChange ||
+                    pendingPeriodChange !== null
+                  }
+                  onClick={() => requestBillingPeriodStep("next")}
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-md text-slate-800 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 20 20"
+                    className="h-4 w-4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <path
+                      d="M7.5 5 12.5 10l-5 5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
+              </div>
+            ) : (
+              <span className="inline-flex min-h-12 w-full items-center justify-center rounded-full bg-slate-100 px-4 py-2 text-center text-sm font-semibold text-slate-800 ring-1 ring-slate-200 sm:w-auto">
+                {activeBillingPeriod}
+              </span>
+            )}
           </div>
           <div className="hidden sm:block sm:flex-1" aria-hidden="true" />
         </section>
@@ -4613,6 +4933,112 @@ export default function Home() {
           </div>
         </div>
       ) : null}
+      {pendingPeriodChange
+        ? (() => {
+            const dialog = (
+              <div
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="confirm-period-title"
+                className="w-full max-w-md rounded-2xl border border-amber-200/80 bg-white p-5 shadow-xl"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <h2
+                  id="confirm-period-title"
+                  className="text-xl font-semibold tracking-tight text-slate-900"
+                >
+                  Confirm Billing Period Change
+                </h2>
+                <p className="mt-2 text-sm text-slate-700">
+                  Switch billing period from{" "}
+                  <span className="font-semibold">
+                    {pendingPeriodChange.from}
+                  </span>{" "}
+                  to{" "}
+                  <span className="font-semibold">
+                    {pendingPeriodChange.to}
+                  </span>
+                  ?
+                </p>
+                {pendingPeriodChange.direction === "next" ? (
+                  <label className="mt-4 flex items-start gap-3 rounded-xl bg-amber-50 px-3 py-3 text-sm text-amber-950 ring-1 ring-amber-200">
+                    <input
+                      type="checkbox"
+                      checked={periodResetChecked}
+                      onChange={(event) =>
+                        setPeriodResetChecked(event.target.checked)
+                      }
+                      className="mt-1 h-4 w-4 rounded border-slate-300"
+                    />
+                    <span>
+                      Start new month (roll over Current kWh → Previous kWh,
+                      clear Electricity Rate, and reset occupied units to
+                      Unpaid)
+                    </span>
+                  </label>
+                ) : (
+                  <p className="mt-4 rounded-xl bg-slate-50 px-3 py-3 text-sm text-slate-600 ring-1 ring-slate-200">
+                    Stepping back only updates the active billing period label.
+                    It will not wipe existing meter readings or payment
+                    statuses.
+                  </p>
+                )}
+                <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:justify-end">
+                  <button
+                    type="button"
+                    disabled={confirmingPeriodChange}
+                    onClick={() => setPendingPeriodChange(null)}
+                    className={secondaryButtonClass}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={confirmingPeriodChange}
+                    onClick={() => void confirmBillingPeriodChange()}
+                    className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+                  >
+                    {confirmingPeriodChange ? "Updating…" : "Confirm Change"}
+                  </button>
+                </div>
+              </div>
+            );
+
+            if (isMobile) {
+              return (
+                <div className="fixed inset-0 z-[55] flex items-end justify-center bg-slate-900/40 p-4 sm:items-center">
+                  <AnimatePresence>
+                    <motion.div
+                      key="period-change-modal"
+                      initial={{ opacity: 0, y: 24 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 16 }}
+                      transition={{ duration: 0.2, ease: APPLE_EASE }}
+                      className="w-full max-w-md"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      {dialog}
+                    </motion.div>
+                  </AnimatePresence>
+                </div>
+              );
+            }
+
+            return (
+              <div
+                className="fixed inset-0 z-[55] flex items-end justify-center bg-slate-900/40 p-4 sm:items-center"
+                onClick={() => {
+                  if (!confirmingPeriodChange) {
+                    setPendingPeriodChange(null);
+                  }
+                }}
+              >
+                {dialog}
+              </div>
+            );
+          })()
+        : null}
+
       {pendingPaidUnitId
         ? (() => {
             const pendingUnit = units.find(
