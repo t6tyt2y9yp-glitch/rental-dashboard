@@ -108,6 +108,7 @@ type LedgerEntry = {
   wholeNumber: boolean;
   datePaid: string;
   paymentMethod: string;
+  status: PaymentStatus;
   receiptUrl: string | null;
   receivedBy: string;
 };
@@ -124,8 +125,24 @@ type PaymentHistoryRecord = {
   billingPeriod: string | null;
   amountPaid: number | null;
   totalPaid: number | null;
+  paymentMethod: string;
+  status: PaymentStatus;
   receiptUrl: string | null;
   receivedBy: string | null;
+};
+
+type PaymentEditDraft = {
+  id: string;
+  unitName: string;
+  baseRent: string;
+  rentPaid: string;
+  electricityPaid: string;
+  consumedKwh: string;
+  totalDue: string;
+  paymentMethod: PaymentMethod | "";
+  status: PaymentStatus;
+  billingPeriod: string;
+  paymentDate: string;
 };
 
 type MeterBill = {
@@ -527,6 +544,10 @@ const fieldClass =
   "min-h-12 w-full rounded-lg border border-slate-300 bg-white px-3 py-3 text-base font-normal text-slate-900 outline-none focus:border-slate-900";
 const primaryButtonClass =
   "inline-flex min-h-12 w-full items-center justify-center rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white hover:bg-slate-700 sm:w-auto";
+const secondaryButtonClass =
+  "inline-flex min-h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50";
+const dangerButtonClass =
+  "inline-flex min-h-10 items-center justify-center rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-800 hover:bg-rose-100";
 
 function asRentTier(value: unknown): RentTier | null {
   const amount = typeof value === "number" ? value : Number(value);
@@ -757,10 +778,12 @@ function mapPaymentHistory(
             row.electricity_charge ?? row.electricity_fee,
           ),
           billingPeriod,
-          amountPaid: historyNumber(row.amount_paid),
+          amountPaid: historyNumber(row.amount_paid ?? row.total_due),
           totalPaid: historyNumber(
             row.amount_paid ?? row.total_due ?? row.totalPaid,
           ),
+          paymentMethod: asPaymentMethod(row.payment_method ?? row.method) || "",
+          status: asPaymentStatus(row.status),
           receiptUrl: typeof row.receipt_url === "string" ? row.receipt_url : null,
           receivedBy:
             typeof row.received_by === "string" && row.received_by.trim()
@@ -783,9 +806,11 @@ function paymentsToLedger(
   unitLabels: Map<string, string>,
 ): LedgerEntry[] {
   return mapPaymentHistory(rows, unitLabels).flatMap((record) => {
-    const source = rows.find((row) => String(row.id) === record.id);
-    const status = typeof source?.status === "string" ? source.status : "";
-    if (status !== "Paid" || record.baseRent === null || record.totalPaid === null) {
+    if (
+      record.status !== "Paid" ||
+      record.baseRent === null ||
+      record.totalPaid === null
+    ) {
       return [];
     }
 
@@ -803,15 +828,138 @@ function paymentsToLedger(
         amountPaid: record.amountPaid,
         wholeNumber: record.baseRent === 5000,
         datePaid: record.paymentDate ?? new Date().toISOString(),
-        paymentMethod:
-          typeof source?.payment_method === "string" && source.payment_method
-            ? source.payment_method
-            : "—",
+        paymentMethod: record.paymentMethod || "—",
+        status: record.status,
         receiptUrl: record.receiptUrl,
         receivedBy: record.receivedBy ?? "—",
       },
     ];
   });
+}
+
+function nullableNumberInput(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) ? "" : String(value);
+}
+
+function parseOptionalNumber(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const amount = Number(trimmed);
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function historyRecordToEditDraft(record: PaymentHistoryRecord): PaymentEditDraft {
+  return {
+    id: record.id,
+    unitName: record.unitName,
+    baseRent: nullableNumberInput(record.baseRent),
+    rentPaid: nullableNumberInput(record.rentPaid ?? record.baseRent),
+    electricityPaid: nullableNumberInput(record.electricityCharge),
+    consumedKwh: nullableNumberInput(record.consumedKwh),
+    totalDue: nullableNumberInput(record.amountPaid ?? record.totalPaid),
+    paymentMethod: asPaymentMethod(record.paymentMethod) || "",
+    status: record.status,
+    billingPeriod: record.billingPeriod ?? "",
+    paymentDate: record.paymentDate ? record.paymentDate.slice(0, 10) : "",
+  };
+}
+
+function ledgerEntryToEditDraft(entry: LedgerEntry): PaymentEditDraft {
+  return {
+    id: entry.id,
+    unitName: entry.unitName,
+    baseRent: nullableNumberInput(entry.baseRent),
+    rentPaid: nullableNumberInput(entry.rentPaid ?? entry.baseRent),
+    electricityPaid: nullableNumberInput(entry.electricityCharge),
+    consumedKwh: nullableNumberInput(entry.consumedKwh),
+    totalDue: nullableNumberInput(entry.amountPaid ?? entry.totalPaid),
+    paymentMethod: asPaymentMethod(entry.paymentMethod) || "",
+    status: entry.status,
+    billingPeriod: entry.billingPeriod ?? "",
+    paymentDate: entry.datePaid ? entry.datePaid.slice(0, 10) : "",
+  };
+}
+
+function sortPaymentHistory(records: PaymentHistoryRecord[]) {
+  return [...records].sort((a, b) => {
+    const aTime = a.paymentDate ? Date.parse(a.paymentDate) : 0;
+    const bTime = b.paymentDate ? Date.parse(b.paymentDate) : 0;
+    return (
+      (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0)
+    );
+  });
+}
+
+function sortLedgerEntries(entries: LedgerEntry[]) {
+  return [...entries].sort((a, b) => {
+    const aTime = Date.parse(a.datePaid);
+    const bTime = Date.parse(b.datePaid);
+    return (
+      (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0)
+    );
+  });
+}
+
+function getStaffMarkPaidBlockers(item: DashboardUnit): string[] {
+  const blockers: string[] = [];
+
+  if (!item.paymentMethod) {
+    blockers.push("payment method");
+  }
+
+  const totalPaid = Number(item.amountPaid);
+  if (
+    item.amountPaid.trim() === "" ||
+    !Number.isFinite(totalPaid) ||
+    totalPaid <= 0
+  ) {
+    blockers.push("total paid");
+  }
+
+  if (item.currentReading.trim() === "") {
+    blockers.push("current reading");
+  } else if (
+    item.previousReading.trim() !== "" &&
+    Number.isFinite(Number(item.previousReading)) &&
+    Number.isFinite(Number(item.currentReading)) &&
+    Number(item.currentReading) < Number(item.previousReading)
+  ) {
+    blockers.push("readings");
+  }
+
+  return blockers;
+}
+
+function staffMarkPaidHint(blockers: string[]) {
+  const needsMethod = blockers.includes("payment method");
+  const needsTotal = blockers.includes("total paid");
+  const needsReadings =
+    blockers.includes("current reading") || blockers.includes("readings");
+
+  if (needsMethod && needsReadings && !needsTotal) {
+    return "Select a payment method and enter readings first.";
+  }
+  if (needsMethod && needsTotal && needsReadings) {
+    return "Select a payment method, enter total paid, and enter readings first.";
+  }
+  if (needsMethod && needsTotal) {
+    return "Select a payment method and enter total paid first.";
+  }
+  if (needsTotal && needsReadings) {
+    return "Enter total paid and readings first.";
+  }
+  if (needsMethod) {
+    return "Select a payment method first.";
+  }
+  if (needsTotal) {
+    return "Enter total paid first.";
+  }
+  if (needsReadings) {
+    return "Enter valid meter readings first.";
+  }
+  return "Complete the required payment fields first.";
 }
 
 function formatExpenseDate(value: string) {
@@ -1133,6 +1281,14 @@ export default function Home() {
   const [paymentHistory, setPaymentHistory] = useState<PaymentHistoryRecord[]>([]);
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
   const [selectedLedgerEntry, setSelectedLedgerEntry] = useState<LedgerEntry | null>(null);
+  const [paymentEditDraft, setPaymentEditDraft] = useState<PaymentEditDraft | null>(
+    null,
+  );
+  const [savingPaymentEdit, setSavingPaymentEdit] = useState(false);
+  const [paymentEditError, setPaymentEditError] = useState<string | null>(null);
+  const [deletingPaymentId, setDeletingPaymentId] = useState<string | null>(null);
+  const [pendingPaidUnitId, setPendingPaidUnitId] = useState<string | null>(null);
+  const [confirmingPaid, setConfirmingPaid] = useState(false);
 
   const isAdmin = isAdminEmail(user?.email);
   const roleLabel = isAdmin ? "Admin" : "Staff";
@@ -1858,8 +2014,86 @@ export default function Home() {
     }
   }
 
+  function canSubmitMarkAsPaid(item: DashboardUnit) {
+    if (item.paymentStatus === "Paid") {
+      return false;
+    }
+    if (!hasValidElectricityRate) {
+      return false;
+    }
+    return getStaffMarkPaidBlockers(item).length === 0;
+  }
+
+  function requestMarkAsPaid(item: DashboardUnit) {
+    if (item.paymentStatus === "Paid") {
+      return;
+    }
+
+    if (!hasValidElectricityRate) {
+      patchUnit(item.id, {
+        message: electricityRateRequiredMessage,
+      });
+      return;
+    }
+
+    const blockers = getStaffMarkPaidBlockers(item);
+    if (blockers.length > 0) {
+      patchUnit(item.id, {
+        message: staffMarkPaidHint(blockers),
+      });
+      return;
+    }
+
+    if (!isAdmin) {
+      setPendingPaidUnitId(item.id);
+      return;
+    }
+
+    // Admin: instant save (unlock on mobile for the chime).
+    if (isMobile) {
+      unlockAudio(audioCtxRef);
+    }
+    void changePaymentStatus(item, "Paid");
+  }
+
+  async function confirmStaffMarkAsPaid() {
+    if (!pendingPaidUnitId) {
+      return;
+    }
+
+    const item = unitsRef.current.find((unit) => unit.id === pendingPaidUnitId);
+    if (!item) {
+      setPendingPaidUnitId(null);
+      return;
+    }
+
+    if (!canSubmitMarkAsPaid(item)) {
+      const blockers = getStaffMarkPaidBlockers(item);
+      patchUnit(item.id, {
+        message: !hasValidElectricityRate
+          ? electricityRateRequiredMessage
+          : staffMarkPaidHint(blockers),
+      });
+      setPendingPaidUnitId(null);
+      return;
+    }
+
+    setConfirmingPaid(true);
+    try {
+      await changePaymentStatus(item, "Paid");
+    } finally {
+      setConfirmingPaid(false);
+      setPendingPaidUnitId(null);
+    }
+  }
+
   async function changePaymentStatus(item: DashboardUnit, next: PaymentStatus) {
     if (next === item.paymentStatus) {
+      return;
+    }
+
+    // Staff cannot change payment status via dropdown — only Mark as Paid.
+    if (!isAdmin && next !== "Paid") {
       return;
     }
 
@@ -1871,12 +2105,21 @@ export default function Home() {
       return;
     }
 
+    if (markingPaid) {
+      const blockers = getStaffMarkPaidBlockers(item);
+      if (blockers.length > 0) {
+        patchUnit(item.id, {
+          message: staffMarkPaidHint(blockers),
+        });
+        return;
+      }
+    }
+
     // Unlock audio during the user gesture so iOS/Android allow the success chime.
+    // Do NOT flip local status to Paid until Supabase writes succeed.
     if (markingPaid && isMobile) {
       unlockAudio(audioCtxRef);
     }
-
-    patchUnit(item.id, { paymentStatus: next, message: null });
 
     const bill = markingPaid
       ? meterBill(
@@ -1925,7 +2168,15 @@ export default function Home() {
       item.paymentDate.trim() || new Date().toISOString().slice(0, 10);
     const billingPeriod = item.billingPeriod.trim() || null;
 
-    if (supabase && markingPaid) {
+    if (markingPaid) {
+      if (!supabase) {
+        patchUnit(item.id, {
+          paymentStatus: item.paymentStatus,
+          message: "Supabase is not configured.",
+        });
+        return;
+      }
+
       const { data, error } = await supabase
         .from("Payments")
         .insert({
@@ -1956,20 +2207,6 @@ export default function Home() {
         return;
       }
 
-      const unitPaidPatch = {
-        paymentId: String(data.id),
-        paymentStatus: "Paid" as const,
-        balance: nextBalance,
-        paymentDate,
-        billingPeriod: billingPeriod ?? item.billingPeriod,
-        rentPaid: String(rentPaidSnapshot),
-        electricityPaid:
-          electricityChargeSnapshot == null
-            ? item.electricityPaid
-            : String(electricityChargeSnapshot),
-        amountPaid: String(amountPaid),
-      };
-
       const { error: unitPaidError } = await supabase
         .from("Units")
         .update({
@@ -1985,14 +2222,27 @@ export default function Home() {
         .eq("id", item.id);
 
       if (unitPaidError) {
-        // Payment row already exists; keep local Paid + warn about unit sync.
         patchUnit(item.id, {
-          ...unitPaidPatch,
+          paymentStatus: item.paymentStatus,
           message: unitPaidError.message,
         });
-      } else {
-        patchUnit(item.id, unitPaidPatch);
+        return;
       }
+
+      patchUnit(item.id, {
+        paymentId: String(data.id),
+        paymentStatus: "Paid",
+        balance: nextBalance,
+        paymentDate,
+        billingPeriod: billingPeriod ?? item.billingPeriod,
+        rentPaid: String(rentPaidSnapshot),
+        electricityPaid:
+          electricityChargeSnapshot == null
+            ? item.electricityPaid
+            : String(electricityChargeSnapshot),
+        amountPaid: String(amountPaid),
+        message: null,
+      });
 
       const labels = new Map(
         unitsRef.current.map((unit) => [unit.id, unit.label]),
@@ -2043,8 +2293,11 @@ export default function Home() {
           paymentStatus: item.paymentStatus,
           message: error.message,
         });
+        return;
       }
     }
+
+    patchUnit(item.id, { paymentStatus: next, message: null });
   }
 
   function focusMatchedUnit(unit: BatchMatchedUnit) {
@@ -2314,30 +2567,38 @@ export default function Home() {
         </dl>
         <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
           Payment status
-          <select
-            value={item.paymentStatus}
-            onChange={(event) => {
-              const next = event.target.value as PaymentStatus;
-              if (next === "Paid" && !hasValidElectricityRate) {
-                patchUnit(item.id, {
-                  message: electricityRateRequiredMessage,
-                });
-                return;
-              }
-              void changePaymentStatus(item, next);
-            }}
-            className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
-          >
-            {PAYMENT_STATUSES.map((status) => (
-              <option
-                key={status}
-                value={status}
-                disabled={status === "Paid" && !hasValidElectricityRate}
-              >
-                {status}
-              </option>
-            ))}
-          </select>
+          {isAdmin ? (
+            <select
+              value={item.paymentStatus}
+              onChange={(event) => {
+                const next = event.target.value as PaymentStatus;
+                if (next === "Paid") {
+                  requestMarkAsPaid(item);
+                  return;
+                }
+                void changePaymentStatus(item, next);
+              }}
+              className={`${fieldClass} py-2 text-sm ${statusTone(item.paymentStatus)}`}
+            >
+              {PAYMENT_STATUSES.map((status) => (
+                <option
+                  key={status}
+                  value={status}
+                  disabled={
+                    status === "Paid" && !canSubmitMarkAsPaid(item)
+                  }
+                >
+                  {status}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <span
+              className={`inline-flex min-h-12 items-center rounded-lg px-3 py-3 text-sm font-semibold ring-1 ${statusTone(item.paymentStatus)}`}
+            >
+              {item.paymentStatus}
+            </span>
+          )}
         </label>
         <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
           Unit status
@@ -2365,79 +2626,94 @@ export default function Home() {
             />
           )}
         </label>
-        <div
-          className={`flex flex-col gap-2 sm:flex-row ${
-            split ? "sm:col-span-2" : ""
-          }`}
-        >
-          {isMobile ? (
+        {(() => {
+          const markPaidBlockers = getStaffMarkPaidBlockers(item);
+          const cannotMarkPaid = !canSubmitMarkAsPaid(item);
+          const markPaidHint = !hasValidElectricityRate
+            ? electricityRateRequiredMessage
+            : markPaidBlockers.length > 0
+              ? staffMarkPaidHint(markPaidBlockers)
+              : null;
+
+          return (
             <>
-              <motion.button
-                type="button"
-                disabled={
-                  item.paymentStatus === "Paid" || !hasValidElectricityRate
-                }
-                whileTap={
-                  item.paymentStatus === "Paid" || !hasValidElectricityRate
-                    ? undefined
-                    : { scale: 0.98 }
-                }
-                onClick={(event) => {
-                  event.stopPropagation();
-                  unlockAudio(audioCtxRef);
-                  void changePaymentStatus(item, "Paid");
-                }}
-                className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+              <div
+                className={`flex flex-col gap-2 sm:flex-row ${
+                  split ? "sm:col-span-2" : ""
+                }`}
               >
-                Mark as Paid
-              </motion.button>
-              <motion.button
-                type="button"
-                whileTap={{ scale: 0.98 }}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void openPaymentHistory(item);
-                }}
-                className={primaryButtonClass}
-              >
-                View History
-              </motion.button>
+                {isMobile ? (
+                  <>
+                    <motion.button
+                      type="button"
+                      disabled={cannotMarkPaid}
+                      whileTap={
+                        cannotMarkPaid ? undefined : { scale: 0.98 }
+                      }
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        if (!canSubmitMarkAsPaid(item)) {
+                          return;
+                        }
+                        requestMarkAsPaid(item);
+                      }}
+                      className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+                    >
+                      Mark as Paid
+                    </motion.button>
+                    <motion.button
+                      type="button"
+                      whileTap={{ scale: 0.98 }}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void openPaymentHistory(item);
+                      }}
+                      className={primaryButtonClass}
+                    >
+                      View History
+                    </motion.button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      disabled={cannotMarkPaid}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        if (!canSubmitMarkAsPaid(item)) {
+                          return;
+                        }
+                        requestMarkAsPaid(item);
+                      }}
+                      className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+                    >
+                      Mark as Paid
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void openPaymentHistory(item);
+                      }}
+                      className={primaryButtonClass}
+                    >
+                      View History
+                    </button>
+                  </>
+                )}
+              </div>
+              {markPaidHint ? (
+                <p
+                  className={`text-sm text-amber-700 ${
+                    split ? "sm:col-span-2" : ""
+                  }`}
+                >
+                  {markPaidHint}
+                </p>
+              ) : null}
             </>
-          ) : (
-            <>
-              <button
-                type="button"
-                disabled={
-                  item.paymentStatus === "Paid" || !hasValidElectricityRate
-                }
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void changePaymentStatus(item, "Paid");
-                }}
-                className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
-              >
-                Mark as Paid
-              </button>
-              <button
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void openPaymentHistory(item);
-                }}
-                className={primaryButtonClass}
-              >
-                View History
-              </button>
-            </>
-          )}
-        </div>
-        {!hasValidElectricityRate ? (
-          <p
-            className={`text-sm text-amber-700 ${split ? "sm:col-span-2" : ""}`}
-          >
-            {electricityRateRequiredMessage}
-          </p>
-        ) : null}
+          );
+        })()}
         {item.message ? (
           <p
             className={`text-sm text-rose-700 ${split ? "sm:col-span-2" : ""}`}
@@ -2648,6 +2924,247 @@ export default function Home() {
       setReceiptNoticeIsError(false);
       setReceiptNotice("Batch finished with no matched units.");
     }
+  }
+
+  function unitLabelsMap() {
+    return new Map(unitsRef.current.map((item) => [item.id, item.label]));
+  }
+
+  function syncSharedPaymentUpdate(row: PaymentRow) {
+    const labels = unitLabelsMap();
+    const [historyRecord] = mapPaymentHistory([row], labels);
+    const [ledgerEntry] = paymentsToLedger([row], labels);
+    const paymentId = String(row.id);
+
+    if (historyRecord) {
+      setPaymentHistory((current) => {
+        if (!current.some((record) => record.id === paymentId)) {
+          return current;
+        }
+        return sortPaymentHistory([
+          historyRecord,
+          ...current.filter((record) => record.id !== paymentId),
+        ]);
+      });
+    }
+
+    setLedger((current) => {
+      const without = current.filter((entry) => entry.id !== paymentId);
+      if (!ledgerEntry) {
+        return without;
+      }
+      return sortLedgerEntries([ledgerEntry, ...without]);
+    });
+
+    setSelectedLedgerEntry((current) => {
+      if (!current || current.id !== paymentId) {
+        return current;
+      }
+      return ledgerEntry ?? null;
+    });
+  }
+
+  function syncSharedPaymentDelete(paymentId: string) {
+    setPaymentHistory((current) =>
+      current.filter((record) => record.id !== paymentId),
+    );
+    setLedger((current) => current.filter((entry) => entry.id !== paymentId));
+    setSelectedLedgerEntry((current) =>
+      current?.id === paymentId ? null : current,
+    );
+    setPaymentEditDraft((current) =>
+      current?.id === paymentId ? null : current,
+    );
+  }
+
+  function openPaymentEditFromHistory(record: PaymentHistoryRecord) {
+    if (!isAdmin) {
+      return;
+    }
+    setPaymentEditError(null);
+    setPaymentEditDraft(historyRecordToEditDraft(record));
+  }
+
+  function openPaymentEditFromLedger(entry: LedgerEntry) {
+    if (!isAdmin) {
+      return;
+    }
+    setPaymentEditError(null);
+    setPaymentEditDraft(ledgerEntryToEditDraft(entry));
+  }
+
+  async function savePaymentEdit() {
+    if (!isAdmin) {
+      return;
+    }
+    if (!paymentEditDraft) {
+      return;
+    }
+    if (!supabase) {
+      setPaymentEditError("Supabase is not configured.");
+      return;
+    }
+
+    const draft = paymentEditDraft;
+    const baseRent = parseOptionalNumber(draft.baseRent);
+    const rentPaid = parseOptionalNumber(draft.rentPaid);
+    const electricityPaid = parseOptionalNumber(draft.electricityPaid);
+    const consumedKwh = parseOptionalNumber(draft.consumedKwh);
+    const totalDue = parseOptionalNumber(draft.totalDue);
+
+    setSavingPaymentEdit(true);
+    setPaymentEditError(null);
+
+    const { data, error } = await supabase
+      .from("Payments")
+      .update({
+        base_rent: baseRent,
+        rent_paid: rentPaid,
+        electricity_fee: electricityPaid ?? 0,
+        electricity_charge: electricityPaid,
+        consumed_kwh: consumedKwh,
+        total_due: totalDue,
+        amount_paid: totalDue,
+        payment_method: draft.paymentMethod || null,
+        status: draft.status,
+        billing_period: draft.billingPeriod.trim() || null,
+        payment_date: draft.paymentDate.trim() || null,
+      })
+      .eq("id", draft.id)
+      .select("*")
+      .single();
+
+    setSavingPaymentEdit(false);
+
+    if (error) {
+      setPaymentEditError(error.message);
+      return;
+    }
+
+    if (data) {
+      syncSharedPaymentUpdate(data);
+    }
+    setPaymentEditDraft(null);
+  }
+
+  async function deletePaymentRecord(paymentId: string, unitName: string) {
+    if (!isAdmin) {
+      return;
+    }
+    if (!supabase) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete this payment record for ${unitName}? This cannot be undone.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingPaymentId(paymentId);
+
+    const { data: paymentRow, error: fetchError } = await supabase
+      .from("Payments")
+      .select("*")
+      .eq("id", paymentId)
+      .maybeSingle();
+
+    if (fetchError) {
+      setDeletingPaymentId(null);
+      window.alert(fetchError.message);
+      return;
+    }
+
+    const unitIdFromPayment =
+      paymentRow?.unit_id !== undefined && paymentRow?.unit_id !== null
+        ? String(paymentRow.unit_id)
+        : paymentRow?.unitId !== undefined && paymentRow?.unitId !== null
+          ? String(paymentRow.unitId)
+          : null;
+    const unitFromName = unitsRef.current.find(
+      (unit) => unit.label === unitName,
+    );
+    const unitId = unitIdFromPayment ?? unitFromName?.id ?? null;
+
+    const { error } = await supabase
+      .from("Payments")
+      .delete()
+      .eq("id", paymentId);
+
+    if (error) {
+      setDeletingPaymentId(null);
+      window.alert(error.message);
+      return;
+    }
+
+    syncSharedPaymentDelete(paymentId);
+
+    if (unitId) {
+      const unit = unitsRef.current.find((row) => row.id === unitId);
+      const currentPeriod = unit?.billingPeriod.trim() ?? "";
+
+      const { data: remainingRows, error: remainingError } = await supabase
+        .from("Payments")
+        .select("id, billing_period, status")
+        .eq("unit_id", unitId);
+
+      if (remainingError) {
+        setDeletingPaymentId(null);
+        window.alert(remainingError.message);
+        return;
+      }
+
+      const hasCurrentPeriodPayment = (remainingRows ?? []).some((row) => {
+        if (asPaymentStatus(row.status) !== "Paid") {
+          return false;
+        }
+        const period =
+          typeof row.billing_period === "string"
+            ? row.billing_period.trim()
+            : "";
+        if (currentPeriod) {
+          return period === currentPeriod;
+        }
+        // Unit has no billing period set — treat empty-period Paid rows as current.
+        return period === "";
+      });
+
+      // Historical delete + current-period Paid still exists → leave Paid.
+      // No remaining Paid payment for the unit's current billing period → Unpaid.
+      const shouldRevert = !hasCurrentPeriodPayment;
+
+      if (shouldRevert) {
+        const { error: unitError } = await supabase
+          .from("Units")
+          .update({
+            payment_status: "Unpaid",
+            payment_date: null,
+            rent_paid: null,
+            electricity_paid: null,
+            total_paid: null,
+          })
+          .eq("id", unitId);
+
+        if (unitError) {
+          setDeletingPaymentId(null);
+          window.alert(unitError.message);
+          return;
+        }
+
+        patchUnit(unitId, {
+          paymentStatus: "Unpaid",
+          paymentDate: "",
+          rentPaid: "",
+          electricityPaid: "",
+          amountPaid: "",
+          paymentId: null,
+          message: null,
+        });
+      }
+    }
+
+    setDeletingPaymentId(null);
   }
 
   async function openPaymentHistory(unit: DashboardUnit) {
@@ -3391,11 +3908,11 @@ export default function Home() {
             <div className="mt-5 max-h-80 overflow-y-auto rounded-xl border border-slate-100">
               <ul className="divide-y divide-slate-100">
                 {filteredLedger.map((entry) => (
-                  <li key={entry.id}>
+                  <li key={entry.id} className="hover:bg-slate-50">
                     <button
                       type="button"
                       onClick={() => setSelectedLedgerEntry(entry)}
-                      className="grid w-full grid-cols-1 gap-2 px-4 py-3 text-left hover:bg-slate-50"
+                      className="grid w-full grid-cols-1 gap-2 px-4 pt-3 pb-2 text-left"
                     >
                       <div className="flex items-start justify-between gap-3">
                         <p className="font-semibold text-slate-900">
@@ -3472,6 +3989,33 @@ export default function Home() {
                         </div>
                       </dl>
                     </button>
+                    {isAdmin ? (
+                      <div className="flex flex-wrap gap-2 px-4 pb-3">
+                        <button
+                          type="button"
+                          className={secondaryButtonClass}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openPaymentEditFromLedger(entry);
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className={dangerButtonClass}
+                          disabled={deletingPaymentId === entry.id}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void deletePaymentRecord(entry.id, entry.unitName);
+                          }}
+                        >
+                          {deletingPaymentId === entry.id
+                            ? "Deleting…"
+                            : "Delete"}
+                        </button>
+                      </div>
+                    ) : null}
                   </li>
                 ))}
               </ul>
@@ -3502,13 +4046,43 @@ export default function Home() {
                   {formatExpenseDate(selectedLedgerEntry.datePaid)}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedLedgerEntry(null)}
-                className={primaryButtonClass}
-              >
-                Close
-              </button>
+              <div className="flex flex-wrap justify-end gap-2">
+                {isAdmin ? (
+                  <>
+                    <button
+                      type="button"
+                      className={secondaryButtonClass}
+                      onClick={() =>
+                        openPaymentEditFromLedger(selectedLedgerEntry)
+                      }
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className={dangerButtonClass}
+                      disabled={deletingPaymentId === selectedLedgerEntry.id}
+                      onClick={() =>
+                        void deletePaymentRecord(
+                          selectedLedgerEntry.id,
+                          selectedLedgerEntry.unitName,
+                        )
+                      }
+                    >
+                      {deletingPaymentId === selectedLedgerEntry.id
+                        ? "Deleting…"
+                        : "Delete"}
+                    </button>
+                  </>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => setSelectedLedgerEntry(null)}
+                  className={primaryButtonClass}
+                >
+                  Close
+                </button>
+              </div>
             </div>
             <div className="mt-5 flex flex-col gap-4 sm:flex-row">
               {selectedLedgerEntry.receiptUrl ? (
@@ -3644,82 +4218,124 @@ export default function Home() {
                   {paymentHistory.map((record) => (
                     <li
                       key={record.id}
-                      className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center"
+                      className="flex flex-col gap-3 px-4 py-4"
                     >
-                      {record.receiptUrl ? (
-                        <button
-                          type="button"
-                          onClick={() => setReceiptPreview(record.receiptUrl)}
-                          className="h-16 w-16 shrink-0 overflow-hidden rounded-lg ring-1 ring-slate-200"
-                        >
-                          <img
-                            src={record.receiptUrl}
-                            alt={`Receipt for ${record.unitName}`}
-                            className="h-full w-full object-cover"
-                          />
-                        </button>
-                      ) : (
-                        <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-lg bg-slate-50 text-center text-xs text-slate-400 ring-1 ring-slate-200">
-                          No receipt
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                        {record.receiptUrl ? (
+                          <button
+                            type="button"
+                            onClick={() => setReceiptPreview(record.receiptUrl)}
+                            className="h-16 w-16 shrink-0 overflow-hidden rounded-lg ring-1 ring-slate-200"
+                          >
+                            <img
+                              src={record.receiptUrl}
+                              alt={`Receipt for ${record.unitName}`}
+                              className="h-full w-full object-cover"
+                            />
+                          </button>
+                        ) : (
+                          <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-lg bg-slate-50 text-center text-xs text-slate-400 ring-1 ring-slate-200">
+                            No receipt
+                          </div>
+                        )}
+                        <dl className="grid flex-1 grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">
+                          <div>
+                            <dt className="text-slate-500">Unit name</dt>
+                            <dd className="font-semibold text-slate-900">
+                              {record.unitName}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Payment date</dt>
+                            <dd className="font-medium">
+                              {record.paymentDate
+                                ? formatExpenseDate(record.paymentDate)
+                                : "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Billing period</dt>
+                            <dd className="font-medium">
+                              {record.billingPeriod ?? "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Rent paid</dt>
+                            <dd className="font-medium">
+                              {formatMaybePeso(
+                                record.rentPaid ?? record.baseRent,
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Electricity paid</dt>
+                            <dd className="font-medium">
+                              {formatMaybePeso(record.electricityCharge)}
+                            </dd>
+                          </div>
+                          <div className="sm:col-span-2 lg:col-span-3">
+                            <dt className="text-slate-500">Consumed kWh</dt>
+                            <dd className="font-medium">
+                              {formatConsumedKwhLine(
+                                record.consumedKwh,
+                                record.electricityRate,
+                                record.electricityCharge,
+                                record.baseRent === 5000,
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Total amount paid</dt>
+                            <dd className="font-semibold text-slate-900">
+                              {formatMaybePeso(
+                                record.amountPaid ?? record.totalPaid,
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Payment method</dt>
+                            <dd className="font-medium">
+                              {record.paymentMethod || "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Status</dt>
+                            <dd className="font-medium">{record.status}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-500">Received by</dt>
+                            <dd className="font-medium">
+                              {record.receivedBy ?? "—"}
+                            </dd>
+                          </div>
+                        </dl>
+                      </div>
+                      {isAdmin ? (
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className={secondaryButtonClass}
+                            onClick={() => openPaymentEditFromHistory(record)}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className={dangerButtonClass}
+                            disabled={deletingPaymentId === record.id}
+                            onClick={() =>
+                              void deletePaymentRecord(
+                                record.id,
+                                record.unitName,
+                              )
+                            }
+                          >
+                            {deletingPaymentId === record.id
+                              ? "Deleting…"
+                              : "Delete"}
+                          </button>
                         </div>
-                      )}
-                      <dl className="grid flex-1 grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">
-                        <div>
-                          <dt className="text-slate-500">Unit name</dt>
-                          <dd className="font-semibold text-slate-900">
-                            {record.unitName}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Payment date</dt>
-                          <dd className="font-medium">
-                            {record.paymentDate
-                              ? formatExpenseDate(record.paymentDate)
-                              : "—"}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Billing period</dt>
-                          <dd className="font-medium">
-                            {record.billingPeriod ?? "—"}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Rent paid</dt>
-                          <dd className="font-medium">
-                            {formatMaybePeso(record.rentPaid ?? record.baseRent)}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Electricity paid</dt>
-                          <dd className="font-medium">
-                            {formatMaybePeso(record.electricityCharge)}
-                          </dd>
-                        </div>
-                        <div className="sm:col-span-2 lg:col-span-3">
-                          <dt className="text-slate-500">Consumed kWh</dt>
-                          <dd className="font-medium">
-                            {formatConsumedKwhLine(
-                              record.consumedKwh,
-                              record.electricityRate,
-                              record.electricityCharge,
-                              record.baseRent === 5000,
-                            )}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Total amount paid</dt>
-                          <dd className="font-semibold text-slate-900">
-                            {formatMaybePeso(
-                              record.amountPaid ?? record.totalPaid,
-                            )}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Received by</dt>
-                          <dd className="font-medium">{record.receivedBy ?? "—"}</dd>
-                        </div>
-                      </dl>
+                      ) : null}
                     </li>
                   ))}
                 </ul>
@@ -3728,6 +4344,333 @@ export default function Home() {
           </div>
         </div>
       ) : null}
+      {pendingPaidUnitId
+        ? (() => {
+            const pendingUnit = units.find(
+              (unit) => unit.id === pendingPaidUnitId,
+            );
+            if (!pendingUnit) {
+              return null;
+            }
+            const totalPaidValue = Number(pendingUnit.amountPaid);
+            return (
+              <div
+                className="fixed inset-0 z-[55] flex items-end justify-center bg-slate-900/35 p-4 backdrop-blur-sm sm:items-center"
+                onClick={() => {
+                  if (!confirmingPaid) {
+                    setPendingPaidUnitId(null);
+                  }
+                }}
+              >
+                <div
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="confirm-paid-title"
+                  className="w-full max-w-md rounded-2xl border border-white/40 bg-white/75 p-5 shadow-xl backdrop-blur-xl"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <h2
+                    id="confirm-paid-title"
+                    className="text-xl font-semibold tracking-tight text-slate-900"
+                  >
+                    Confirm payment
+                  </h2>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Double-check these details before saving.
+                  </p>
+                  <dl className="mt-5 grid grid-cols-1 gap-3 text-sm">
+                    <div>
+                      <dt className="text-slate-500">Unit name</dt>
+                      <dd className="font-semibold text-slate-900">
+                        {pendingUnit.label}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-slate-500">Billing period</dt>
+                      <dd className="font-medium text-slate-900">
+                        {pendingUnit.billingPeriod.trim() || "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-slate-500">Total paid</dt>
+                      <dd className="font-semibold text-slate-900">
+                        {Number.isFinite(totalPaidValue)
+                          ? formatMaybePeso(totalPaidValue)
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-slate-500">Payment method</dt>
+                      <dd className="font-medium text-slate-900">
+                        {pendingUnit.paymentMethod || "—"}
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:justify-end">
+                    <button
+                      type="button"
+                      disabled={confirmingPaid}
+                      onClick={() => setPendingPaidUnitId(null)}
+                      className={secondaryButtonClass}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={confirmingPaid}
+                      onClick={() => {
+                        unlockAudio(audioCtxRef);
+                        void confirmStaffMarkAsPaid();
+                      }}
+                      className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+                    >
+                      {confirmingPaid ? "Saving…" : "Confirm Payment"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()
+        : null}
+
+      {paymentEditDraft ? (
+        <div
+          className="fixed inset-0 z-[55] flex items-end justify-center bg-slate-900/40 p-4 sm:items-center"
+          onClick={() => {
+            if (!savingPaymentEdit) {
+              setPaymentEditDraft(null);
+              setPaymentEditError(null);
+            }
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-payment-title"
+            className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white p-5 shadow-lg"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2
+                  id="edit-payment-title"
+                  className="text-xl font-semibold tracking-tight"
+                >
+                  Edit payment
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  {paymentEditDraft.unitName}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={savingPaymentEdit}
+                onClick={() => {
+                  setPaymentEditDraft(null);
+                  setPaymentEditError(null);
+                }}
+                className={secondaryButtonClass}
+              >
+                Close
+              </button>
+            </div>
+            <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Base rent
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  inputMode="decimal"
+                  value={paymentEditDraft.baseRent}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? { ...current, baseRent: event.target.value }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Rent paid
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  inputMode="decimal"
+                  value={paymentEditDraft.rentPaid}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? { ...current, rentPaid: event.target.value }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Electricity paid
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  inputMode="decimal"
+                  value={paymentEditDraft.electricityPaid}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? { ...current, electricityPaid: event.target.value }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Consumed kWh
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  inputMode="decimal"
+                  value={paymentEditDraft.consumedKwh}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? { ...current, consumedKwh: event.target.value }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Total due / paid
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  inputMode="decimal"
+                  value={paymentEditDraft.totalDue}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? { ...current, totalDue: event.target.value }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Payment method
+                <select
+                  value={paymentEditDraft.paymentMethod}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? {
+                            ...current,
+                            paymentMethod: asPaymentMethod(event.target.value),
+                          }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                >
+                  <option value="">Choose method</option>
+                  {PAYMENT_METHODS.map((method) => (
+                    <option key={method} value={method}>
+                      {method}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Status
+                <select
+                  value={paymentEditDraft.status}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? {
+                            ...current,
+                            status: event.target.value as PaymentStatus,
+                          }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                >
+                  {PAYMENT_STATUSES.map((status) => (
+                    <option key={status} value={status}>
+                      {status}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                Payment date
+                <input
+                  type="date"
+                  value={paymentEditDraft.paymentDate}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? { ...current, paymentDate: event.target.value }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700 sm:col-span-2">
+                Billing period
+                <input
+                  type="text"
+                  value={paymentEditDraft.billingPeriod}
+                  onChange={(event) =>
+                    setPaymentEditDraft((current) =>
+                      current
+                        ? { ...current, billingPeriod: event.target.value }
+                        : current,
+                    )
+                  }
+                  className={fieldClass}
+                />
+              </label>
+            </div>
+            {paymentEditError ? (
+              <p className="mt-3 text-sm text-rose-700">{paymentEditError}</p>
+            ) : null}
+            <div className="mt-5 flex flex-col gap-2 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                disabled={savingPaymentEdit}
+                onClick={() => {
+                  setPaymentEditDraft(null);
+                  setPaymentEditError(null);
+                }}
+                className={secondaryButtonClass}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={savingPaymentEdit}
+                onClick={() => void savePaymentEdit()}
+                className={`${primaryButtonClass} disabled:cursor-not-allowed disabled:bg-slate-400`}
+              >
+                {savingPaymentEdit ? "Saving…" : "Save Changes"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {receiptPreview ? (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/90 p-3 sm:p-5"
