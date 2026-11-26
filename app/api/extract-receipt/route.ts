@@ -9,13 +9,13 @@ Extract ALL of these fields:
 3. payment_date: the receipt date as ISO YYYY-MM-DD (e.g. "2026-11-18" from "Date: November 18, 2026").
 4. rent_paid: the rent peso amount as a number (e.g. 2500 from "₱2,500 + ₱126").
 5. electricity_paid: the electricity peso amount as a number (e.g. 126).
-6. billing_period: the period text from "As payment for" (e.g. "October - November 2026").
+6. billing_period: ALWAYS extract the period text from "As payment for" / "payment for" (e.g. "October - November 2026", "Oct - Nov 2026"). Copy the period as written when readable. If the billing period is missing, blank, cut off, or unreadable, return null (not an empty string and not a guess).
 7. total_paid: the total peso amount paid as a number (e.g. 2626).
 
 Return ONLY a raw JSON object with exactly these keys:
 unit (string), current_kwh (number|null), payment_date (string|null), rent_paid (number|null), electricity_paid (number|null), billing_period (string|null), total_paid (number|null).
 Do not use markdown or code fences.
-If a field is missing, use an empty string for unit/billing_period/payment_date strings, or null for numbers.`;
+If a field is missing, use an empty string for unit/payment_date strings, null for billing_period when unreadable/missing, or null for numbers.`;
 
 type ReceiptExtraction = {
   unit: string;

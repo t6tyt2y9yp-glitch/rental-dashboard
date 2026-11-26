@@ -25,6 +25,17 @@ const DISPLAY_NAME_BY_EMAIL: Record<string, string> = {
 const ELECTRICITY_RATE_STORAGE_KEY = "rental-dashboard:electricity-rate";
 const ELECTRICITY_RATE_DISMISSED_KEY =
   "rental-dashboard:electricity-rate-dismissed-at";
+/** Toggle silly suffixes on warning / error / blocker copy. Set false to disable. */
+const ALERT_SUFFIX_ENABLED = true;
+const ALERT_SUFFIXES = [
+  ", Renzo.",
+  ", retard.",
+  ", rabbit.",
+  ", yot.",
+  ", dumbass.",
+] as const;
+const ALERT_SUFFIX_PATTERN =
+  /(?:,\s*(?:Renzo|retard|rabbit|yot|dumbass))\.?\s*$/iu;
 const MONTH_NAMES = [
   "January",
   "February",
@@ -83,6 +94,8 @@ type DashboardUnit = {
   currentReading: string;
   paymentDate: string;
   billingPeriod: string;
+  /** OCR draft only — never overwrites active billingPeriod. */
+  scannedBillingPeriod: string | null;
   rentPaid: string;
   electricityPaid: string;
   amountPaid: string;
@@ -158,6 +171,26 @@ function asBalance(value: unknown) {
   }
   const amount = typeof value === "number" ? value : Number(value);
   return Number.isFinite(amount) ? amount : 0;
+}
+
+function formatAlert(message: string) {
+  // Strip trailing period(s) and any prior silly suffix so we never double-append.
+  const trimmed = message
+    .replace(ALERT_SUFFIX_PATTERN, "")
+    .replace(/\.+\s*$/u, "")
+    .trimEnd();
+  if (!trimmed) {
+    return message;
+  }
+  if (!ALERT_SUFFIX_ENABLED) {
+    return `${trimmed}.`;
+  }
+  let hash = 0;
+  for (let index = 0; index < trimmed.length; index += 1) {
+    hash =
+      (hash + trimmed.charCodeAt(index) * (index + 1)) % ALERT_SUFFIXES.length;
+  }
+  return `${trimmed}${ALERT_SUFFIXES[hash] ?? ALERT_SUFFIXES[0]}`;
 }
 
 function readingToInput(value: unknown) {
@@ -651,6 +684,7 @@ function mapUnits(unitRows: UnitRow[], paymentRows: PaymentRow[]): DashboardUnit
             : "",
         billingPeriod:
           typeof row.billing_period === "string" ? row.billing_period.trim() : "",
+        scannedBillingPeriod: null,
         rentPaid: moneyToInput(row.rent_paid),
         electricityPaid: moneyToInput(row.electricity_paid),
         amountPaid: moneyToInput(row.total_paid ?? row.amount_paid),
@@ -907,6 +941,95 @@ function hasScannedReceipt(item: DashboardUnit) {
   return Boolean(item.receiptUrl);
 }
 
+const MONTH_NAME_LOOKUP: Record<string, string> = {
+  jan: "january",
+  january: "january",
+  feb: "february",
+  february: "february",
+  mar: "march",
+  march: "march",
+  apr: "april",
+  april: "april",
+  may: "may",
+  jun: "june",
+  june: "june",
+  jul: "july",
+  july: "july",
+  aug: "august",
+  august: "august",
+  sep: "september",
+  sept: "september",
+  september: "september",
+  oct: "october",
+  october: "october",
+  nov: "november",
+  november: "november",
+  dec: "december",
+  december: "december",
+};
+
+function normalizeBillingPeriod(value: string | null | undefined) {
+  if (!value) {
+    return "";
+  }
+
+  const text = value
+    .toLowerCase()
+    .replace(/[–—−]/g, "-")
+    .replace(/,/g, " ")
+    .replace(/\s*-\s*/g, " - ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return text
+    .split(" ")
+    .map((token) => {
+      if (token === "-") {
+        return "-";
+      }
+      const cleaned = token.replace(/[^a-z0-9]/g, "");
+      if (!cleaned) {
+        return "";
+      }
+      if (/^\d{4}$/.test(cleaned)) {
+        return cleaned;
+      }
+      return (
+        MONTH_NAME_LOOKUP[cleaned] ??
+        MONTH_NAME_LOOKUP[cleaned.slice(0, 3)] ??
+        cleaned
+      );
+    })
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s*-\s*/g, " - ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasBillingPeriodMismatch(item: DashboardUnit) {
+  if (!item.receiptUrl) {
+    return false;
+  }
+  const scanned = item.scannedBillingPeriod?.trim() ?? "";
+  if (!scanned) {
+    return true;
+  }
+  return (
+    normalizeBillingPeriod(scanned) !==
+    normalizeBillingPeriod(item.billingPeriod)
+  );
+}
+
+function billingPeriodMismatchMessage(item: DashboardUnit) {
+  const scanned = item.scannedBillingPeriod?.trim() ?? "";
+  if (!scanned) {
+    return "Billing period could not be read from the receipt. Please check the photo or re-scan.";
+  }
+  const active = item.billingPeriod.trim() || "—";
+  return `Wrong billing period on receipt: Receipt says ${scanned}, but current billing period is ${active}.`;
+}
+
 function getStaffMarkPaidBlockers(item: DashboardUnit): string[] {
   const blockers: string[] = [];
 
@@ -938,7 +1061,7 @@ function getStaffMarkPaidBlockers(item: DashboardUnit): string[] {
 }
 
 const STAFF_RECEIPT_REQUIRED_HINT =
-  "Scan a receipt image first before marking as paid, dumbass.";
+  "Scan a receipt image first before marking as paid.";
 
 function staffMarkPaidHint(blockers: string[]) {
   const needsMethod = blockers.includes("payment method");
@@ -1131,22 +1254,20 @@ function ReceiptThumbnail({
 function unitPatchFromExtraction(
   extraction: ReceiptExtraction,
   receiptUrl: string | null,
-  options?: { allowBillingPeriod?: boolean },
 ): Partial<DashboardUnit> {
   const unitPatch: Partial<DashboardUnit> = {
     currentReading: String(extraction.current_kwh),
     receiptUrl,
+    // Keep OCR period on a draft field — never overwrite active billingPeriod.
+    scannedBillingPeriod:
+      typeof extraction.billing_period === "string" &&
+      extraction.billing_period.trim()
+        ? extraction.billing_period.trim()
+        : null,
     message: null,
   };
   if (typeof extraction.payment_date === "string" && extraction.payment_date) {
     unitPatch.paymentDate = extraction.payment_date;
-  }
-  if (
-    options?.allowBillingPeriod &&
-    typeof extraction.billing_period === "string" &&
-    extraction.billing_period.trim()
-  ) {
-    unitPatch.billingPeriod = extraction.billing_period.trim();
   }
   if (
     typeof extraction.rent_paid === "number" &&
@@ -1969,6 +2090,7 @@ export default function Home() {
           currentReading: "",
           paymentDate: "",
           billingPeriod: nextPeriod,
+          scannedBillingPeriod: null,
           rentPaid: "",
           electricityPaid: "",
           amountPaid: "",
@@ -2036,6 +2158,9 @@ export default function Home() {
     if (!isAdmin && !hasScannedReceipt(item)) {
       return false;
     }
+    if (!isAdmin && hasBillingPeriodMismatch(item)) {
+      return false;
+    }
     return true;
   }
 
@@ -2047,6 +2172,13 @@ export default function Home() {
     if (!isAdmin && !hasScannedReceipt(item)) {
       patchUnit(item.id, {
         message: STAFF_RECEIPT_REQUIRED_HINT,
+      });
+      return;
+    }
+
+    if (!isAdmin && hasBillingPeriodMismatch(item)) {
+      patchUnit(item.id, {
+        message: billingPeriodMismatchMessage(item),
       });
       return;
     }
@@ -2069,6 +2201,15 @@ export default function Home() {
     if (!isAdmin) {
       setPendingPaidUnitId(item.id);
       return;
+    }
+
+    if (hasBillingPeriodMismatch(item)) {
+      const confirmed = window.confirm(
+        `${formatAlert(billingPeriodMismatchMessage(item))}\n\nLog this payment anyway?`,
+      );
+      if (!confirmed) {
+        return;
+      }
     }
 
     // Admin: instant save (unlock on mobile for the chime).
@@ -2095,9 +2236,11 @@ export default function Home() {
         message:
           !isAdmin && !hasScannedReceipt(item)
             ? STAFF_RECEIPT_REQUIRED_HINT
-            : !hasValidElectricityRate
-              ? electricityRateRequiredMessage
-              : staffMarkPaidHint(blockers),
+            : !isAdmin && hasBillingPeriodMismatch(item)
+              ? billingPeriodMismatchMessage(item)
+              : !hasValidElectricityRate
+                ? electricityRateRequiredMessage
+                : staffMarkPaidHint(blockers),
       });
       setPendingPaidUnitId(null);
       return;
@@ -2126,6 +2269,13 @@ export default function Home() {
     if (markingPaid && !isAdmin && !hasScannedReceipt(item)) {
       patchUnit(item.id, {
         message: STAFF_RECEIPT_REQUIRED_HINT,
+      });
+      return;
+    }
+
+    if (markingPaid && !isAdmin && hasBillingPeriodMismatch(item)) {
+      patchUnit(item.id, {
+        message: billingPeriodMismatchMessage(item),
       });
       return;
     }
@@ -2359,6 +2509,7 @@ export default function Home() {
         : bill.totalAmountDue;
     const moneyMismatch = ocrMoneyMismatch(item);
     const readingMismatch = ocrReadingMismatch(item);
+    const billingMismatch = hasBillingPeriodMismatch(item);
 
     return (
       <div
@@ -2376,6 +2527,16 @@ export default function Home() {
             onOpen={() => setReceiptPreview(item.receiptUrl)}
           />
         ) : null}
+        {billingMismatch ? (
+          <div
+            role="alert"
+            className={`rounded-xl border border-rose-300 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-900 ${
+              split ? "sm:col-span-2" : ""
+            }`}
+          >
+            {formatAlert(billingPeriodMismatchMessage(item))}
+          </div>
+        ) : null}
         {moneyMismatch || readingMismatch ? (
           <div
             className={`space-y-2 ${split ? "sm:col-span-2" : ""}`}
@@ -2383,20 +2544,16 @@ export default function Home() {
           >
             {moneyMismatch ? (
               <p className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                Amount mismatch: rent paid (
-                {peso(Number(item.rentPaid))}) + electricity paid (
-                {peso(Number(item.electricityPaid))}) does not equal total paid (
-                {peso(Number(item.amountPaid))}). Check the receipt before
-                marking as paid.
+                {formatAlert(
+                  `Amount mismatch: rent paid (${peso(Number(item.rentPaid))}) + electricity paid (${peso(Number(item.electricityPaid))}) does not equal total paid (${peso(Number(item.amountPaid))}). Check the receipt before marking as paid.`,
+                )}
               </p>
             ) : null}
             {readingMismatch ? (
               <p className="rounded-xl border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-900">
-                Reading mismatch: current kWh (
-                {Number(item.currentReading).toLocaleString("en-PH")}) is lower
-                than previous kWh (
-                {Number(item.previousReading).toLocaleString("en-PH")}). Verify
-                the handwritten meter reading.
+                {formatAlert(
+                  `Reading mismatch: current kWh (${Number(item.currentReading).toLocaleString("en-PH")}) is lower than previous kWh (${Number(item.previousReading).toLocaleString("en-PH")}). Verify the handwritten meter reading.`,
+                )}
               </p>
             ) : null}
           </div>
@@ -2661,14 +2818,17 @@ export default function Home() {
         {(() => {
           const markPaidBlockers = getStaffMarkPaidBlockers(item);
           const scannedReceipt = hasScannedReceipt(item);
+          const periodMismatch = hasBillingPeriodMismatch(item);
           const cannotMarkPaid = !canSubmitMarkAsPaid(item);
           const markPaidHint = !hasValidElectricityRate
             ? electricityRateRequiredMessage
             : !isAdmin && !scannedReceipt
               ? STAFF_RECEIPT_REQUIRED_HINT
-              : markPaidBlockers.length > 0
-                ? staffMarkPaidHint(markPaidBlockers)
-                : null;
+              : !isAdmin && periodMismatch
+                ? billingPeriodMismatchMessage(item)
+                : markPaidBlockers.length > 0
+                  ? staffMarkPaidHint(markPaidBlockers)
+                  : null;
 
           return (
             <>
@@ -2743,7 +2903,7 @@ export default function Home() {
                     split ? "sm:col-span-2" : ""
                   }`}
                 >
-                  {markPaidHint}
+                  {formatAlert(markPaidHint)}
                 </p>
               ) : null}
             </>
@@ -2753,7 +2913,7 @@ export default function Home() {
           <p
             className={`text-sm text-rose-700 ${split ? "sm:col-span-2" : ""}`}
           >
-            {item.message}
+            {formatAlert(item.message)}
           </p>
         ) : null}
       </div>
@@ -2830,9 +2990,7 @@ export default function Home() {
           unit.id === matched.id
             ? {
                 ...unit,
-                ...unitPatchFromExtraction(extraction, null, {
-                  allowBillingPeriod: isAdmin,
-                }),
+                ...unitPatchFromExtraction(extraction, null),
                 message: uploadMessage,
               }
             : unit,
@@ -2854,9 +3012,7 @@ export default function Home() {
     }
 
     // Draft only: populate editable card fields. Never auto Mark as Paid.
-    const unitPatch = unitPatchFromExtraction(extraction, receiptUrl, {
-      allowBillingPeriod: isAdmin,
-    });
+    const unitPatch = unitPatchFromExtraction(extraction, receiptUrl);
     setUnits((prev) => {
       const next = prev.map((unit) =>
         unit.id === matched.id ? { ...unit, ...unitPatch } : unit,
@@ -3110,7 +3266,7 @@ export default function Home() {
 
     if (fetchError) {
       setDeletingPaymentId(null);
-      window.alert(fetchError.message);
+      window.alert(formatAlert(fetchError.message));
       return;
     }
 
@@ -3132,7 +3288,7 @@ export default function Home() {
 
     if (error) {
       setDeletingPaymentId(null);
-      window.alert(error.message);
+      window.alert(formatAlert(error.message));
       return;
     }
 
@@ -3149,7 +3305,7 @@ export default function Home() {
 
       if (remainingError) {
         setDeletingPaymentId(null);
-        window.alert(remainingError.message);
+        window.alert(formatAlert(remainingError.message));
         return;
       }
 
@@ -3186,7 +3342,7 @@ export default function Home() {
 
         if (unitError) {
           setDeletingPaymentId(null);
-          window.alert(unitError.message);
+          window.alert(formatAlert(unitError.message));
           return;
         }
 
@@ -3308,7 +3464,7 @@ export default function Home() {
             </label>
             {loginError ? (
               <p className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-                {loginError}
+                {formatAlert(loginError)}
               </p>
             ) : null}
             <button
@@ -3363,14 +3519,16 @@ export default function Home() {
             className="flex flex-col gap-3 rounded-2xl bg-amber-50 px-4 py-3 text-amber-950 ring-1 ring-amber-200 sm:flex-row sm:items-center sm:justify-between"
           >
             <p className="text-sm font-medium sm:text-[0.95rem]">
-              {electricityRateNotice.rate == null
-                ? `Electricity rate cleared by ${electricityRateNotice.updatedBy} at ${formatRateNoticeTime(electricityRateNotice.updatedAt)}`
-                : `Electricity rate updated to ₱${Number(
-                    electricityRateNotice.rate,
-                  ).toLocaleString("en-PH", {
-                    minimumFractionDigits: 0,
-                    maximumFractionDigits: 4,
-                  })}/kWh by ${electricityRateNotice.updatedBy} at ${formatRateNoticeTime(electricityRateNotice.updatedAt)}`}
+              {formatAlert(
+                electricityRateNotice.rate == null
+                  ? `Electricity rate cleared by ${electricityRateNotice.updatedBy} at ${formatRateNoticeTime(electricityRateNotice.updatedAt)}`
+                  : `Electricity rate updated to ₱${Number(
+                      electricityRateNotice.rate,
+                    ).toLocaleString("en-PH", {
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 4,
+                    })}/kWh by ${electricityRateNotice.updatedBy} at ${formatRateNoticeTime(electricityRateNotice.updatedAt)}`,
+              )}
             </p>
             <button
               type="button"
@@ -3484,7 +3642,9 @@ export default function Home() {
                   : "border border-emerald-200 bg-emerald-50 text-emerald-800"
               }`}
             >
-              {receiptNotice}
+              {receiptNoticeIsError
+                ? formatAlert(receiptNotice)
+                : receiptNotice}
             </p>
           ) : null}
           {!scanningReceipt &&
@@ -3521,7 +3681,10 @@ export default function Home() {
                         className="rounded-lg bg-rose-50 px-3 py-2"
                       >
                         <span className="font-medium">{item.fileName}</span>
-                        <span className="text-rose-600"> — {item.reason}</span>
+                        <span className="text-rose-600">
+                          {" "}
+                          — {formatAlert(item.reason)}
+                        </span>
                       </li>
                     ))}
                   </ul>
@@ -3537,7 +3700,7 @@ export default function Home() {
 
         {loadError ? (
           <p className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-            {loadError}
+            {formatAlert(loadError)}
           </p>
         ) : null}
 
@@ -3847,7 +4010,9 @@ export default function Home() {
           </form>
 
           {expensesError ? (
-            <p className="mt-3 text-sm text-rose-700">{expensesError}</p>
+            <p className="mt-3 text-sm text-rose-700">
+              {formatAlert(expensesError)}
+            </p>
           ) : null}
 
           {expensesLoading ? (
@@ -4311,7 +4476,7 @@ export default function Home() {
                 <div className="h-24 animate-pulse rounded-xl bg-white" />
               ) : historyError ? (
                 <p className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-                  {historyError}
+                  {formatAlert(historyError)}
                 </p>
               ) : paymentHistory.length === 0 ? (
                 <p className="rounded-xl bg-white px-4 py-6 text-sm text-slate-500 ring-1 ring-slate-200">
@@ -4748,7 +4913,9 @@ export default function Home() {
               </label>
             </div>
             {paymentEditError ? (
-              <p className="mt-3 text-sm text-rose-700">{paymentEditError}</p>
+              <p className="mt-3 text-sm text-rose-700">
+                {formatAlert(paymentEditError)}
+              </p>
             ) : null}
             <div className="mt-5 flex flex-col gap-2 sm:flex-row sm:justify-end">
               <button
