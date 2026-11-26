@@ -1403,12 +1403,25 @@ function ReceiptThumbnail({
   );
 }
 
+function sanitizeKwhReading(value: unknown): string {
+  const digits = String(value ?? "").replace(/[^\d.]/g, "");
+  if (!digits || digits === ".") {
+    return "";
+  }
+  // Keep a single decimal point if present; strip trailing junk decimals.
+  const match = /^(\d+)(?:\.(\d+))?/.exec(digits);
+  if (!match) {
+    return "";
+  }
+  return match[2] ? `${match[1]}.${match[2]}` : match[1];
+}
+
 function unitPatchFromExtraction(
   extraction: ReceiptExtraction,
   receiptUrl: string | null,
 ): Partial<DashboardUnit> {
   const unitPatch: Partial<DashboardUnit> = {
-    currentReading: String(extraction.current_kwh),
+    currentReading: sanitizeKwhReading(extraction.current_kwh),
     receiptUrl,
     // Keep OCR period on a draft field — never overwrite active billingPeriod.
     scannedBillingPeriod:
@@ -1556,7 +1569,7 @@ export default function Home() {
   const [receiptNotice, setReceiptNotice] = useState<string | null>(null);
   const [receiptNoticeIsError, setReceiptNoticeIsError] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [openUnitIds, setOpenUnitIds] = useState<Record<string, boolean>>({});
+  const [expandedUnitId, setExpandedUnitId] = useState<string | null>(null);
   const [selectedDesktopUnitId, setSelectedDesktopUnitId] = useState<
     string | null
   >(null);
@@ -2719,10 +2732,7 @@ export default function Home() {
   function focusMatchedUnit(unit: BatchMatchedUnit) {
     setActiveTier(unit.baseRent);
     setSelectedDesktopUnitId(unit.unitId);
-    setOpenUnitIds((current) => ({
-      ...current,
-      [unit.unitId]: true,
-    }));
+    setExpandedUnitId(unit.unitId);
   }
 
   function renderUnitEditor(
@@ -3244,10 +3254,9 @@ export default function Home() {
     }
 
     const extraction = payload as ReceiptExtraction;
-    if (
-      typeof extraction.current_kwh !== "number" ||
-      !Number.isFinite(extraction.current_kwh)
-    ) {
+    const sanitizedKwh = sanitizeKwhReading(extraction.current_kwh);
+    const parsedKwh = Number(sanitizedKwh);
+    if (!sanitizedKwh || !Number.isFinite(parsedKwh)) {
       return {
         matched: null,
         failed: {
@@ -3257,6 +3266,7 @@ export default function Home() {
         },
       };
     }
+    extraction.current_kwh = parsedKwh;
 
     const unitName =
       typeof extraction.unit === "string" ? extraction.unit.trim() : "";
@@ -4294,7 +4304,7 @@ export default function Home() {
                   className="grid grid-cols-1 gap-4"
                 >
                   {visibleUnits.map((item) => {
-                    const expanded = openUnitIds[item.id] === true;
+                    const expanded = expandedUnitId === item.id;
                     return (
                       <motion.article
                         key={item.id}
@@ -4306,10 +4316,9 @@ export default function Home() {
                           aria-expanded={expanded}
                           whileTap={{ scale: 0.98 }}
                           onClick={() =>
-                            setOpenUnitIds((current) => ({
-                              ...current,
-                              [item.id]: !current[item.id],
-                            }))
+                            setExpandedUnitId((current) =>
+                              current === item.id ? null : item.id,
+                            )
                           }
                           className="flex w-full items-center gap-3 px-4 py-3 text-left"
                         >
@@ -4333,7 +4342,10 @@ export default function Home() {
                             fill="currentColor"
                             aria-hidden="true"
                             animate={{ rotate: expanded ? 180 : 0 }}
-                            transition={{ duration: 0.22, ease: APPLE_EASE }}
+                            transition={{
+                              duration: expanded ? 0.28 : 0.22,
+                              ease: APPLE_EASE,
+                            }}
                             className="h-5 w-5 shrink-0 text-slate-500"
                           >
                             <path
@@ -4350,19 +4362,38 @@ export default function Home() {
                               initial={
                                 reduceMotion
                                   ? false
-                                  : { height: 0, opacity: 0 }
+                                  : {
+                                      height: 0,
+                                      opacity: 0,
+                                      scale: 0.97,
+                                      y: -6,
+                                    }
                               }
-                              animate={{ height: "auto", opacity: 1 }}
+                              animate={{
+                                height: "auto",
+                                opacity: 1,
+                                scale: 1,
+                                y: 0,
+                                transition: {
+                                  duration: 0.28,
+                                  ease: APPLE_EASE,
+                                },
+                              }}
                               exit={
                                 reduceMotion
                                   ? undefined
-                                  : { height: 0, opacity: 0 }
+                                  : {
+                                      height: 0,
+                                      opacity: 0,
+                                      scale: 0.98,
+                                      y: -4,
+                                      transition: {
+                                        duration: 0.22,
+                                        ease: APPLE_EASE,
+                                      },
+                                    }
                               }
-                              transition={{
-                                duration: 0.22,
-                                ease: APPLE_EASE,
-                              }}
-                              className="overflow-hidden"
+                              className="overflow-hidden origin-top"
                             >
                               <div className="px-4 pb-4">
                                 {renderUnitEditor(item)}

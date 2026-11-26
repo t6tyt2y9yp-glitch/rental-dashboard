@@ -5,12 +5,12 @@ const MAX_GEMINI_ATTEMPTS = 3;
 
 const SYSTEM_INSTRUCTION = `Analyze this handwritten rental receipt or notebook ledger page.
 Extract ALL of these fields:
-1. unit: the tenant or unit identifier next to "RECEIVED from" (e.g. "9n", "9N", "Unit 1"). Copy as written.
-2. current_kwh: the current kWh meter reading number only (e.g. 666 from "666 Kwh").
+1. unit: the tenant or unit identifier next to "RECEIVED from" (e.g. "9n", "9N", "8N", "Unit 1"). Copy as written.
+2. current_kwh: the current kWh meter reading as a number ONLY (digits). Look anywhere near the top header / title area, including when the reading is jammed against printed text with no space (e.g. "RECEIPT713kwh", "RECEIPT 713 kWh", "713kwh"). Extract only the numeric value (713). Do not include the word kWh/Kwh.
 3. payment_date: the receipt date as ISO YYYY-MM-DD (e.g. "2026-11-18" from "Date: November 18, 2026").
 4. rent_paid: the rent peso amount as a number (e.g. 2500 from "₱2,500 + ₱126").
 5. electricity_paid: the electricity peso amount as a number (e.g. 126).
-6. billing_period: ALWAYS extract the period text from "As payment for" / "payment for" (e.g. "October - November 2026", "Oct - Nov 2026"). Copy the period as written when readable. If the billing period is missing, blank, cut off, or unreadable, return null (not an empty string and not a guess).
+6. billing_period: ALWAYS extract the period from parentheses and/or after "As payment for" / "payment for", even when handwriting is cursive or the hyphen is tight with no spaces (e.g. "October-November 2026", "(October-November 2026)"). Normalize to spaced hyphens like "October - November 2026". If the billing period is missing, blank, cut off, or unreadable, return null (not an empty string and not a guess).
 7. total_paid: the total peso amount paid as a number (e.g. 2626).
 
 Return ONLY a raw JSON object with exactly these keys:
@@ -124,6 +124,21 @@ function toNullableString(value: unknown): string | null {
   return text ? text : null;
 }
 
+function normalizeBillingPeriod(value: unknown): string | null {
+  const text = toNullableString(value);
+  if (!text) {
+    return null;
+  }
+
+  // Drop wrapping parentheses and normalize tight month-month hyphens.
+  const unwrapped = text.replace(/^\((.*)\)$/, "$1").trim();
+  const spaced = unwrapped
+    .replace(/([A-Za-z])\s*[-–—]\s*([A-Za-z])/g, "$1 - $2")
+    .replace(/\s+/g, " ")
+    .trim();
+  return spaced || null;
+}
+
 function toIsoDate(value: unknown): string | null {
   const text = toNullableString(value);
   if (!text) {
@@ -163,7 +178,7 @@ function parseReceipt(text: string): ReceiptExtraction {
   const payment_date = toIsoDate(record.payment_date);
   const rent_paid = toNullableNumber(record.rent_paid);
   const electricity_paid = toNullableNumber(record.electricity_paid);
-  const billing_period = toNullableString(record.billing_period);
+  const billing_period = normalizeBillingPeriod(record.billing_period);
   const total_paid =
     toNullableNumber(record.total_paid) ?? toNullableNumber(record.amountPaid);
 
