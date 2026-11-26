@@ -902,6 +902,11 @@ function sortLedgerEntries(entries: LedgerEntry[]) {
   });
 }
 
+function hasScannedReceipt(item: DashboardUnit) {
+  // Unit card stores the uploaded receipt on receiptUrl after a scan.
+  return Boolean(item.receiptUrl);
+}
+
 function getStaffMarkPaidBlockers(item: DashboardUnit): string[] {
   const blockers: string[] = [];
 
@@ -931,6 +936,9 @@ function getStaffMarkPaidBlockers(item: DashboardUnit): string[] {
 
   return blockers;
 }
+
+const STAFF_RECEIPT_REQUIRED_HINT =
+  "Scan a receipt image first before marking as paid, dumbass.";
 
 function staffMarkPaidHint(blockers: string[]) {
   const needsMethod = blockers.includes("payment method");
@@ -1281,6 +1289,7 @@ export default function Home() {
   const [paymentHistory, setPaymentHistory] = useState<PaymentHistoryRecord[]>([]);
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
   const [selectedLedgerEntry, setSelectedLedgerEntry] = useState<LedgerEntry | null>(null);
+  const [expandedPaymentId, setExpandedPaymentId] = useState<string | null>(null);
   const [paymentEditDraft, setPaymentEditDraft] = useState<PaymentEditDraft | null>(
     null,
   );
@@ -2021,11 +2030,24 @@ export default function Home() {
     if (!hasValidElectricityRate) {
       return false;
     }
-    return getStaffMarkPaidBlockers(item).length === 0;
+    if (getStaffMarkPaidBlockers(item).length > 0) {
+      return false;
+    }
+    if (!isAdmin && !hasScannedReceipt(item)) {
+      return false;
+    }
+    return true;
   }
 
   function requestMarkAsPaid(item: DashboardUnit) {
     if (item.paymentStatus === "Paid") {
+      return;
+    }
+
+    if (!isAdmin && !hasScannedReceipt(item)) {
+      patchUnit(item.id, {
+        message: STAFF_RECEIPT_REQUIRED_HINT,
+      });
       return;
     }
 
@@ -2070,9 +2092,12 @@ export default function Home() {
     if (!canSubmitMarkAsPaid(item)) {
       const blockers = getStaffMarkPaidBlockers(item);
       patchUnit(item.id, {
-        message: !hasValidElectricityRate
-          ? electricityRateRequiredMessage
-          : staffMarkPaidHint(blockers),
+        message:
+          !isAdmin && !hasScannedReceipt(item)
+            ? STAFF_RECEIPT_REQUIRED_HINT
+            : !hasValidElectricityRate
+              ? electricityRateRequiredMessage
+              : staffMarkPaidHint(blockers),
       });
       setPendingPaidUnitId(null);
       return;
@@ -2098,6 +2123,13 @@ export default function Home() {
     }
 
     const markingPaid = next === "Paid";
+    if (markingPaid && !isAdmin && !hasScannedReceipt(item)) {
+      patchUnit(item.id, {
+        message: STAFF_RECEIPT_REQUIRED_HINT,
+      });
+      return;
+    }
+
     if (markingPaid && !hasValidElectricityRate) {
       patchUnit(item.id, {
         message: electricityRateRequiredMessage,
@@ -2628,12 +2660,15 @@ export default function Home() {
         </label>
         {(() => {
           const markPaidBlockers = getStaffMarkPaidBlockers(item);
+          const scannedReceipt = hasScannedReceipt(item);
           const cannotMarkPaid = !canSubmitMarkAsPaid(item);
           const markPaidHint = !hasValidElectricityRate
             ? electricityRateRequiredMessage
-            : markPaidBlockers.length > 0
-              ? staffMarkPaidHint(markPaidBlockers)
-              : null;
+            : !isAdmin && !scannedReceipt
+              ? STAFF_RECEIPT_REQUIRED_HINT
+              : markPaidBlockers.length > 0
+                ? staffMarkPaidHint(markPaidBlockers)
+                : null;
 
           return (
             <>
@@ -2974,6 +3009,9 @@ export default function Home() {
     );
     setPaymentEditDraft((current) =>
       current?.id === paymentId ? null : current,
+    );
+    setExpandedPaymentId((current) =>
+      current === paymentId ? null : current,
     );
   }
 
@@ -3886,6 +3924,7 @@ export default function Home() {
                   setLedgerSearch("");
                   setLedgerMonth("");
                   setSelectedLedgerEntry(null);
+                  setExpandedPaymentId(null);
                 }}
                 className={primaryButtonClass}
               >
@@ -3907,21 +3946,10 @@ export default function Home() {
           ) : (
             <div className="mt-5 max-h-80 overflow-y-auto rounded-xl border border-slate-100">
               <ul className="divide-y divide-slate-100">
-                {filteredLedger.map((entry) => (
-                  <li key={entry.id} className="hover:bg-slate-50">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedLedgerEntry(entry)}
-                      className="grid w-full grid-cols-1 gap-2 px-4 pt-3 pb-2 text-left"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <p className="font-semibold text-slate-900">
-                          {entry.unitName}
-                        </p>
-                        <p className="font-semibold text-slate-900">
-                          {formatMaybePeso(entry.totalPaid, entry.wholeNumber)}
-                        </p>
-                      </div>
+                {filteredLedger.map((entry) => {
+                  const expanded = expandedPaymentId === entry.id;
+                  const expandedDetails = (
+                    <div className="space-y-3 border-t border-slate-100 px-4 pb-3 pt-3">
                       <dl className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
                         <div>
                           <dt className="text-slate-500">Date paid</dt>
@@ -3981,43 +4009,119 @@ export default function Home() {
                           <dt className="text-slate-500">Received by</dt>
                           <dd className="font-medium">{entry.receivedBy}</dd>
                         </div>
-                        <div>
-                          <dt className="text-slate-500">Receipt</dt>
-                          <dd className="font-medium">
-                            {entry.receiptUrl ? "Image attached" : "No receipt"}
-                          </dd>
-                        </div>
                       </dl>
-                    </button>
-                    {isAdmin ? (
-                      <div className="flex flex-wrap gap-2 px-4 pb-3">
-                        <button
-                          type="button"
-                          className={secondaryButtonClass}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            openPaymentEditFromLedger(entry);
-                          }}
-                        >
-                          Edit
-                        </button>
-                        <button
-                          type="button"
-                          className={dangerButtonClass}
-                          disabled={deletingPaymentId === entry.id}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void deletePaymentRecord(entry.id, entry.unitName);
-                          }}
-                        >
-                          {deletingPaymentId === entry.id
-                            ? "Deleting…"
-                            : "Delete"}
-                        </button>
-                      </div>
-                    ) : null}
-                  </li>
-                ))}
+                      {entry.receiptUrl ? (
+                        <ReceiptThumbnail
+                          receiptUrl={entry.receiptUrl}
+                          label={entry.unitName}
+                          className="max-w-xs"
+                          onOpen={() => setReceiptPreview(entry.receiptUrl)}
+                        />
+                      ) : (
+                        <p className="text-sm text-slate-400">No receipt</p>
+                      )}
+                      {isAdmin ? (
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className={secondaryButtonClass}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openPaymentEditFromLedger(entry);
+                            }}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className={dangerButtonClass}
+                            disabled={deletingPaymentId === entry.id}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void deletePaymentRecord(
+                                entry.id,
+                                entry.unitName,
+                              );
+                            }}
+                          >
+                            {deletingPaymentId === entry.id
+                              ? "Deleting…"
+                              : "Delete"}
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+
+                  return (
+                    <li key={entry.id} className="hover:bg-slate-50">
+                      <button
+                        type="button"
+                        aria-expanded={expanded}
+                        onClick={() =>
+                          setExpandedPaymentId((current) =>
+                            current === entry.id ? null : entry.id,
+                          )
+                        }
+                        className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate font-semibold text-slate-900">
+                            {entry.unitName}
+                          </p>
+                          <p className="mt-0.5 truncate text-sm text-slate-500">
+                            {entry.billingPeriod?.trim() || "—"}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <p className="font-semibold text-slate-900">
+                            {formatMaybePeso(
+                              entry.totalPaid,
+                              entry.wholeNumber,
+                            )}
+                          </p>
+                          <svg
+                            aria-hidden="true"
+                            viewBox="0 0 20 20"
+                            className={`h-4 w-4 text-slate-500 transition-transform duration-200 ${
+                              expanded ? "rotate-180" : "rotate-0"
+                            }`}
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                          >
+                            <path
+                              d="M5 7.5 10 12.5 15 7.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        </div>
+                      </button>
+                      {isMobile ? (
+                        <AnimatePresence initial={false}>
+                          {expanded ? (
+                            <motion.div
+                              key={`${entry.id}-details`}
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: "auto", opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              transition={{
+                                duration: 0.2,
+                                ease: APPLE_EASE,
+                              }}
+                              className="overflow-hidden"
+                            >
+                              {expandedDetails}
+                            </motion.div>
+                          ) : null}
+                        </AnimatePresence>
+                      ) : expanded ? (
+                        expandedDetails
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           )}
