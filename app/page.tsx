@@ -72,9 +72,14 @@ type BatchMatchedUnit = {
   baseRent: RentTier;
 };
 
+type ReceiptErrorType = "EXTERNAL_OVERLOAD" | "IMAGE_ERROR";
+
 type BatchFailedItem = {
   fileName: string;
   reason: string;
+  errorType: ReceiptErrorType;
+  /** Kept for EXTERNAL_OVERLOAD so Retry can re-scan without a retake. */
+  file?: File;
 };
 
 type BatchProgress = {
@@ -3163,29 +3168,78 @@ export default function Home() {
     );
   }
 
+  function parseReceiptApiError(
+    payload: unknown,
+    responseOk: boolean,
+  ): { errorType: ReceiptErrorType; message: string } | null {
+    if (responseOk) {
+      return null;
+    }
+
+    if (payload && typeof payload === "object") {
+      const record = payload as Record<string, unknown>;
+      const message =
+        typeof record.message === "string"
+          ? record.message
+          : typeof record.error === "string"
+            ? record.error
+            : "Receipt extraction failed.";
+      const errorType: ReceiptErrorType =
+        record.errorType === "EXTERNAL_OVERLOAD" ||
+        record.errorType === "IMAGE_ERROR"
+          ? record.errorType
+          : /503|429|500|overloaded|unavailable|rate.?limit|timeout|network/i.test(
+                message,
+              )
+            ? "EXTERNAL_OVERLOAD"
+            : "IMAGE_ERROR";
+      return { errorType, message };
+    }
+
+    return {
+      errorType: "EXTERNAL_OVERLOAD",
+      message: "Gemini server is overloaded right now—tap Retry.",
+    };
+  }
+
   async function processReceiptFile(file: File): Promise<{
     matched: BatchMatchedUnit | null;
     failed: BatchFailedItem | null;
   }> {
     const image = await compressReceiptImage(file);
-    const response = await fetch("/api/extract-receipt", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image, mimeType: "image/jpeg" }),
-    });
-    const payload: unknown = await response.json();
+    let payload: unknown;
+    let response: Response;
 
-    if (!response.ok) {
-      const errorMessage =
-        payload &&
-        typeof payload === "object" &&
-        "error" in payload &&
-        typeof payload.error === "string"
-          ? payload.error
-          : "Receipt extraction failed.";
+    try {
+      response = await fetch("/api/extract-receipt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image, mimeType: "image/jpeg" }),
+      });
+      payload = await response.json();
+    } catch {
       return {
         matched: null,
-        failed: { fileName: file.name, reason: errorMessage },
+        failed: {
+          fileName: file.name,
+          reason: "Gemini server is overloaded right now—tap Retry.",
+          errorType: "EXTERNAL_OVERLOAD",
+          file,
+        },
+      };
+    }
+
+    const apiError = parseReceiptApiError(payload, response.ok);
+    if (apiError) {
+      return {
+        matched: null,
+        failed: {
+          fileName: file.name,
+          reason: apiError.message,
+          errorType: apiError.errorType,
+          file:
+            apiError.errorType === "EXTERNAL_OVERLOAD" ? file : undefined,
+        },
       };
     }
 
@@ -3198,7 +3252,8 @@ export default function Home() {
         matched: null,
         failed: {
           fileName: file.name,
-          reason: "The receipt did not include a kWh reading.",
+          reason: "The receipt did not include a readable kWh reading.",
+          errorType: "IMAGE_ERROR",
         },
       };
     }
@@ -3215,6 +3270,7 @@ export default function Home() {
           reason: unitName
             ? `No unit matches “${unitName}”.`
             : "The receipt did not include a unit name.",
+          errorType: "IMAGE_ERROR",
         },
       };
     }
@@ -3250,6 +3306,8 @@ export default function Home() {
         failed: {
           fileName: file.name,
           reason: `Matched ${matched.label}, but receipt image was not stored: ${uploadMessage}`,
+          errorType: "EXTERNAL_OVERLOAD",
+          file,
         },
       };
     }
@@ -3274,91 +3332,125 @@ export default function Home() {
     };
   }
 
-  async function scanGlobalReceiptBatch(files: File[]) {
+  async function scanGlobalReceiptBatch(
+    files: File[],
+    options?: { mergeResults?: boolean },
+  ) {
     if (files.length === 0) {
       return;
     }
 
+    const mergeResults = options?.mergeResults === true;
     setScanningReceipt(true);
     setReceiptNotice(null);
     setReceiptNoticeIsError(false);
-    setBatchMatched([]);
-    setBatchFailed([]);
+    if (!mergeResults) {
+      setBatchMatched([]);
+      setBatchFailed([]);
+    }
     setBatchProgress({ current: 0, total: files.length });
 
     const matchedUnits: BatchMatchedUnit[] = [];
     const failedItems: BatchFailedItem[] = [];
-    const matchedIds = new Set<string>();
-
-    // Process up to 2 at a time to avoid Gemini rate limits.
-    const concurrency = Math.min(2, files.length);
-    let nextIndex = 0;
+    const matchedIds = new Set<string>(
+      mergeResults ? batchMatched.map((unit) => unit.unitId) : [],
+    );
     let completed = 0;
+    const chunkSize = 2;
+    const chunkDelayMs = 300;
 
-    async function worker() {
-      while (nextIndex < files.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        const file = files[index];
+    for (let offset = 0; offset < files.length; offset += chunkSize) {
+      const chunk = files.slice(offset, offset + chunkSize);
+      await Promise.all(
+        chunk.map(async (file) => {
+          try {
+            const result = await processReceiptFile(file);
+            if (result.matched && !matchedIds.has(result.matched.unitId)) {
+              matchedIds.add(result.matched.unitId);
+              matchedUnits.push(result.matched);
+            }
+            if (result.failed) {
+              failedItems.push(result.failed);
+            }
+          } catch (error) {
+            failedItems.push({
+              fileName: file.name,
+              reason:
+                error instanceof Error
+                  ? error.message
+                  : "Gemini server is overloaded right now—tap Retry.",
+              errorType: "EXTERNAL_OVERLOAD",
+              file,
+            });
+          } finally {
+            completed += 1;
+            setBatchProgress({ current: completed, total: files.length });
+          }
+        }),
+      );
 
-        try {
-          const result = await processReceiptFile(file);
-          if (result.matched && !matchedIds.has(result.matched.unitId)) {
-            matchedIds.add(result.matched.unitId);
-            matchedUnits.push(result.matched);
-          }
-          if (result.failed) {
-            failedItems.push(result.failed);
-          }
-        } catch (error) {
-          failedItems.push({
-            fileName: file.name,
-            reason:
-              error instanceof Error
-                ? error.message
-                : "Receipt extraction failed.",
-          });
-        } finally {
-          completed += 1;
-          setBatchProgress({ current: completed, total: files.length });
-        }
+      if (offset + chunkSize < files.length) {
+        await new Promise((resolve) => setTimeout(resolve, chunkDelayMs));
       }
     }
-
-    await Promise.all(
-      Array.from({ length: concurrency }, () => worker()),
-    );
 
     matchedUnits.sort((a, b) =>
       a.label.localeCompare(b.label, undefined, { numeric: true }),
     );
-    setBatchMatched(matchedUnits);
-    setBatchFailed(failedItems);
+
+    if (mergeResults) {
+      setBatchMatched((current) => {
+        const byId = new Map(current.map((unit) => [unit.unitId, unit]));
+        for (const unit of matchedUnits) {
+          byId.set(unit.unitId, unit);
+        }
+        return [...byId.values()].sort((a, b) =>
+          a.label.localeCompare(b.label, undefined, { numeric: true }),
+        );
+      });
+      setBatchFailed((current) => [
+        ...current.filter((item) => item.errorType !== "EXTERNAL_OVERLOAD"),
+        ...failedItems,
+      ]);
+    } else {
+      setBatchMatched(matchedUnits);
+      setBatchFailed(failedItems);
+    }
+
     setBatchProgress(null);
     setScanningReceipt(false);
 
-    if (matchedUnits.length === 0 && failedItems.length > 0) {
+    const totalFailed = mergeResults
+      ? failedItems.length +
+        batchFailed.filter((item) => item.errorType === "IMAGE_ERROR").length
+      : failedItems.length;
+    const totalMatched = mergeResults
+      ? matchedIds.size
+      : matchedUnits.length;
+
+    if (failedItems.length > 0) {
       announceWarning();
+    }
+
+    if (totalMatched === 0 && totalFailed > 0) {
       setReceiptNoticeIsError(true);
       setReceiptNotice(
-        `Batch finished with ${failedItems.length} issue${failedItems.length === 1 ? "" : "s"} and no matched units.`,
+        `Batch finished with ${totalFailed} issue${totalFailed === 1 ? "" : "s"} and no matched units.`,
       );
-    } else if (matchedUnits.length > 0) {
+    } else if (totalMatched > 0) {
       const summary =
-        failedItems.length === 0
-          ? `Scan Complete — ${matchedUnits.length} Unit${matchedUnits.length === 1 ? "" : "s"} Updated`
-          : `Scan Complete — ${matchedUnits.length} matched, ${failedItems.length} need attention`;
+        totalFailed === 0
+          ? `Scan Complete — ${totalMatched} Unit${totalMatched === 1 ? "" : "s"} Updated`
+          : `Scan Complete — ${totalMatched} matched, ${totalFailed} need attention`;
       announceSuccess(summary);
-      if (failedItems.length > 0) {
-        announceWarning();
+      if (totalFailed > 0) {
         setReceiptNoticeIsError(false);
         setReceiptNotice(
-          `Batch finished: ${matchedUnits.length} matched, ${failedItems.length} need attention.`,
+          `Batch finished: ${totalMatched} matched, ${totalFailed} need attention.`,
         );
       }
-      // Warn if any matched unit still has receipt validation issues.
-      const hasScanWarning = matchedUnits.some((matched) => {
-        const unit = unitsRef.current.find((row) => row.id === matched.unitId);
+      const hasScanWarning = [...matchedIds].some((unitId) => {
+        const unit = unitsRef.current.find((row) => row.id === unitId);
         return (
           unit != null &&
           (hasBillingPeriodMismatch(unit) ||
@@ -3373,6 +3465,24 @@ export default function Home() {
       setReceiptNoticeIsError(false);
       setReceiptNotice("Batch finished with no matched units.");
     }
+  }
+
+  async function retryServerFailedScans() {
+    const serverFailed = batchFailed.filter(
+      (item) => item.errorType === "EXTERNAL_OVERLOAD" && item.file,
+    );
+    if (serverFailed.length === 0 || scanningReceipt) {
+      return;
+    }
+
+    unlockAudio(audioCtxRef);
+    const files = serverFailed
+      .map((item) => item.file)
+      .filter((file): file is File => file instanceof File);
+    setBatchFailed((current) =>
+      current.filter((item) => item.errorType !== "EXTERNAL_OVERLOAD"),
+    );
+    await scanGlobalReceiptBatch(files, { mergeResults: true });
   }
 
   function unitLabelsMap() {
@@ -3991,23 +4101,83 @@ export default function Home() {
               ) : null}
               {batchFailed.length > 0 ? (
                 <div className={batchMatched.length > 0 ? "mt-4" : undefined}>
-                  <p className="text-sm font-medium text-rose-800">
-                    Needs Attention / Failed
-                  </p>
-                  <ul className="mt-2 space-y-1.5 text-sm text-rose-700">
-                    {batchFailed.map((item) => (
-                      <li
-                        key={`${item.fileName}-${item.reason}`}
-                        className="rounded-lg bg-rose-50 px-3 py-2"
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-medium text-rose-800">
+                      Needs Attention / Failed
+                    </p>
+                    {batchFailed.some(
+                      (item) => item.errorType === "EXTERNAL_OVERLOAD",
+                    ) ? (
+                      <button
+                        type="button"
+                        onClick={() => void retryServerFailedScans()}
+                        disabled={scanningReceipt}
+                        className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-60"
                       >
-                        <span className="font-medium">{item.fileName}</span>
-                        <span className="text-rose-600">
-                          {" "}
-                          — {formatAlert(item.reason)}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
+                        Retry Server Errors
+                      </button>
+                    ) : null}
+                  </div>
+                  {(["EXTERNAL_OVERLOAD", "IMAGE_ERROR"] as const).map(
+                    (errorType) => {
+                      const items = batchFailed.filter(
+                        (item) => item.errorType === errorType,
+                      );
+                      if (items.length === 0) {
+                        return null;
+                      }
+
+                      const isServer = errorType === "EXTERNAL_OVERLOAD";
+                      return (
+                        <div key={errorType} className="mt-3">
+                          <p
+                            className={`text-xs font-semibold uppercase tracking-wide ${
+                              isServer ? "text-amber-700" : "text-rose-700"
+                            }`}
+                          >
+                            {isServer
+                              ? "Server / External Error"
+                              : "Image / Receipt Error"}
+                          </p>
+                          <ul className="mt-2 space-y-1.5 text-sm">
+                            {items.map((item) => (
+                              <li
+                                key={`${errorType}-${item.fileName}-${item.reason}`}
+                                className={`rounded-lg px-3 py-2 ${
+                                  isServer
+                                    ? "bg-amber-50 text-amber-900"
+                                    : "bg-rose-50 text-rose-700"
+                                }`}
+                              >
+                                <span
+                                  className={`mr-2 inline-flex rounded-md px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
+                                    isServer
+                                      ? "bg-amber-200 text-amber-900"
+                                      : "bg-rose-200 text-rose-900"
+                                  }`}
+                                >
+                                  {isServer ? "Server" : "Image"}
+                                </span>
+                                <span className="font-medium">
+                                  {item.fileName}
+                                </span>
+                                <span
+                                  className={
+                                    isServer
+                                      ? "text-amber-800"
+                                      : "text-rose-600"
+                                  }
+                                >
+                                  {" "}
+                                  — {formatAlert(item.reason)}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      );
+                    },
+                  )}
                 </div>
               ) : null}
             </div>

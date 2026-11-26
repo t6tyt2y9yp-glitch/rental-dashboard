@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 
 const MODEL = "gemini-4-hydrogen";
+const MAX_GEMINI_ATTEMPTS = 3;
 
 const SYSTEM_INSTRUCTION = `Analyze this handwritten rental receipt or notebook ledger page.
 Extract ALL of these fields:
@@ -27,6 +28,8 @@ type ReceiptExtraction = {
   total_paid: number | null;
 };
 
+type ReceiptErrorType = "EXTERNAL_OVERLOAD" | "IMAGE_ERROR";
+
 const ALLOWED_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -38,8 +41,19 @@ const ALLOWED_MIME_TYPES = new Set([
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
-function jsonError(message: string, status: number) {
-  return Response.json({ error: message }, { status });
+const EXTERNAL_OVERLOAD_MESSAGE =
+  "Gemini server is overloaded right now—tap Retry.";
+
+function jsonError(
+  errorType: ReceiptErrorType,
+  message: string,
+  status: number,
+) {
+  return Response.json({ errorType, message, error: message }, { status });
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseImage(body: unknown): { data: string; mimeType: string } | null {
@@ -135,7 +149,7 @@ function parseReceipt(text: string): ReceiptExtraction {
   const parsed: unknown = JSON.parse(jsonText);
 
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Model response was not a JSON object.");
+    throw new Error("The receipt could not be read clearly. Please re-scan.");
   }
 
   const record = parsed as Record<string, unknown>;
@@ -154,7 +168,7 @@ function parseReceipt(text: string): ReceiptExtraction {
     toNullableNumber(record.total_paid) ?? toNullableNumber(record.amountPaid);
 
   if (current_kwh === null) {
-    throw new Error("The receipt did not include a kWh reading.");
+    throw new Error("The receipt did not include a readable kWh reading.");
   }
 
   return {
@@ -174,22 +188,126 @@ function publicErrorMessage(error: unknown, apiKey: string) {
   return message.split(apiKey).join("[redacted]");
 }
 
+function isExternalOverloadError(error: unknown) {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : JSON.stringify(error ?? "");
+  const status =
+    error && typeof error === "object" && "status" in error
+      ? Number((error as { status?: unknown }).status)
+      : error && typeof error === "object" && "code" in error
+        ? Number((error as { code?: unknown }).code)
+        : NaN;
+
+  if ([429, 500, 502, 503, 504].includes(status)) {
+    return true;
+  }
+
+  return /503|429|500|502|504|UNAVAILABLE|RESOURCE_EXHAUSTED|rate.?limit|timeout|timed out|ECONNRESET|ENOTFOUND|fetch failed|network|overloaded|quota/i.test(
+    message,
+  );
+}
+
+async function generateReceiptWithRetry(
+  ai: GoogleGenAI,
+  image: { data: string; mimeType: string },
+) {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < MAX_GEMINI_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await ai.models.generateContent({
+        model: MODEL,
+        contents: [
+          {
+            inlineData: {
+              mimeType: image.mimeType,
+              data: image.data,
+            },
+          },
+        ],
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          responseMimeType: "application/json",
+          responseJsonSchema: {
+            type: "object",
+            additionalProperties: false,
+            required: [
+              "unit",
+              "current_kwh",
+              "payment_date",
+              "rent_paid",
+              "electricity_paid",
+              "billing_period",
+              "total_paid",
+            ],
+            properties: {
+              unit: { type: "string" },
+              current_kwh: {
+                anyOf: [{ type: "number" }, { type: "null" }],
+              },
+              payment_date: {
+                anyOf: [{ type: "string" }, { type: "null" }],
+              },
+              rent_paid: {
+                anyOf: [{ type: "number" }, { type: "null" }],
+              },
+              electricity_paid: {
+                anyOf: [{ type: "number" }, { type: "null" }],
+              },
+              billing_period: {
+                anyOf: [{ type: "string" }, { type: "null" }],
+              },
+              total_paid: {
+                anyOf: [{ type: "number" }, { type: "null" }],
+              },
+            },
+          },
+        },
+      });
+
+      return response;
+    } catch (error) {
+      lastError = error;
+      const retryable = isExternalOverloadError(error);
+      const isLastAttempt = attempt >= MAX_GEMINI_ATTEMPTS - 1;
+      if (!retryable || isLastAttempt) {
+        throw error;
+      }
+      const delayMs = 1000 * 2 ** attempt;
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Receipt extraction failed.");
+}
+
 export async function POST(request: Request) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return jsonError("Server is missing GEMINI_API_KEY.", 500);
+    return jsonError(
+      "EXTERNAL_OVERLOAD",
+      "Server is missing GEMINI_API_KEY.",
+      500,
+    );
   }
 
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return jsonError("Request body must be JSON.", 400);
+    return jsonError("IMAGE_ERROR", "Request body must be JSON.", 400);
   }
 
   const image = parseImage(body);
   if (!image) {
     return jsonError(
+      "IMAGE_ERROR",
       "Expected a base64 image in the image field, optionally as a data URL.",
       400,
     );
@@ -197,62 +315,27 @@ export async function POST(request: Request) {
 
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: [
-        {
-          inlineData: {
-            mimeType: image.mimeType,
-            data: image.data,
-          },
-        },
-      ],
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: "application/json",
-        responseJsonSchema: {
-          type: "object",
-          additionalProperties: false,
-          required: [
-            "unit",
-            "current_kwh",
-            "payment_date",
-            "rent_paid",
-            "electricity_paid",
-            "billing_period",
-            "total_paid",
-          ],
-          properties: {
-            unit: { type: "string" },
-            current_kwh: {
-              anyOf: [{ type: "number" }, { type: "null" }],
-            },
-            payment_date: {
-              anyOf: [{ type: "string" }, { type: "null" }],
-            },
-            rent_paid: {
-              anyOf: [{ type: "number" }, { type: "null" }],
-            },
-            electricity_paid: {
-              anyOf: [{ type: "number" }, { type: "null" }],
-            },
-            billing_period: {
-              anyOf: [{ type: "string" }, { type: "null" }],
-            },
-            total_paid: {
-              anyOf: [{ type: "number" }, { type: "null" }],
-            },
-          },
-        },
-      },
-    });
+    const response = await generateReceiptWithRetry(ai, image);
 
     if (!response.text) {
-      return jsonError("Model returned an empty response.", 502);
+      return jsonError("EXTERNAL_OVERLOAD", EXTERNAL_OVERLOAD_MESSAGE, 503);
     }
 
-    return Response.json(parseReceipt(response.text));
+    try {
+      return Response.json(parseReceipt(response.text));
+    } catch (parseError) {
+      const message = publicErrorMessage(parseError, apiKey);
+      return jsonError("IMAGE_ERROR", message, 422);
+    }
   } catch (error) {
-    return jsonError(publicErrorMessage(error, apiKey), 502);
+    if (isExternalOverloadError(error)) {
+      return jsonError("EXTERNAL_OVERLOAD", EXTERNAL_OVERLOAD_MESSAGE, 503);
+    }
+
+    return jsonError(
+      "IMAGE_ERROR",
+      publicErrorMessage(error, apiKey),
+      502,
+    );
   }
 }
